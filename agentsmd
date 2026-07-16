@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+PROGRAM_NAME="agentsmd"
+SHARED_FILE="${AGENTSMD_SHARED_FILE:-$HOME/AGENTS.shared.md}"
+LOCAL_FILE="${AGENTSMD_LOCAL_FILE:-$HOME/AGENTS.local.md}"
+OUTPUT_FILE="${AGENTSMD_OUTPUT_FILE:-$HOME/AGENTS.md}"
+OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"
+BACKUP_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/agentsmd/backups"
+
+# Bash 3.2 treats an empty array as unset under `set -u`. Keep an empty
+# sentinel so cleanup is safe before the first temporary path is registered.
+TEMP_PATHS=("")
+
+cleanup() {
+    local temporary_path
+
+    for temporary_path in "${TEMP_PATHS[@]}"; do
+        if [[ -n "$temporary_path" && -e "$temporary_path" ]]; then
+            if [[ -d "$temporary_path" ]]; then
+                rm -r "$temporary_path"
+            else
+                rm "$temporary_path"
+            fi
+        fi
+    done
+}
+
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+usage() {
+    cat <<EOF
+Build and manage a shared AGENTS.md file.
+
+Usage:
+  $PROGRAM_NAME <command>
+
+Commands:
+  status   Show the source files, generated file freshness, and harness links
+  build    Show the proposed AGENTS.md diff and apply it after approval
+  install  Create or repair the Copilot, Claude Code, Codex, and Pi links
+  help     Show this help text
+
+Files:
+  Shared source:  $(display_path "$SHARED_FILE")
+  Local source:   $(display_path "$LOCAL_FILE")
+  Generated file: $(display_path "$OUTPUT_FILE")
+  Backups:        $(display_path "$BACKUP_HOME")
+
+The generated file is local build output. It may contain private local
+instructions, so agentsmd writes it with owner-only permissions.
+
+Typical workflow:
+  1. Create AGENTS.shared.md and AGENTS.local.md.
+  2. Run "$PROGRAM_NAME build" and review the proposed diff.
+  3. Run "$PROGRAM_NAME install" once to connect the supported harnesses.
+  4. Run "$PROGRAM_NAME status" whenever you want to check for drift.
+
+The build command combines AGENTS.shared.md followed by AGENTS.local.md. It
+shows the proposed change with "git diff --no-index" and only applies it after
+you enter the full word "yes". The diff may contain private local instructions.
+
+The install command points each supported harness directly at the generated
+file. It backs up every file or link that it replaces and also requires you to
+enter "yes".
+
+Optional environment variables:
+  AGENTSMD_SHARED_FILE  Override the shared source path
+  AGENTSMD_LOCAL_FILE   Override the local source path
+  AGENTSMD_OUTPUT_FILE  Override the generated file path
+  XDG_CACHE_HOME        Override the default backup directory
+
+None of these commands pull, push, commit, or make network requests.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+display_path() {
+    local file_path="$1"
+
+    case "$file_path" in
+        "$HOME")
+            printf '~'
+            ;;
+        "$HOME"/*)
+            printf '~/%s' "${file_path#"$HOME"/}"
+            ;;
+        *)
+            printf '%s' "$file_path"
+            ;;
+    esac
+}
+
+new_temp_dir() {
+    local temporary_dir
+
+    temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentsmd.XXXXXX")"
+    printf '%s' "$temporary_dir"
+}
+
+file_mode() {
+    local file_path="$1"
+    local mode
+
+    if mode="$(stat -f '%Lp' "$file_path" 2>/dev/null)"; then
+        printf '%s' "$mode"
+        return
+    fi
+
+    if mode="$(stat -c '%a' "$file_path" 2>/dev/null)"; then
+        printf '%s' "$mode"
+        return
+    fi
+
+    return 1
+}
+
+validate_paths() {
+    local configured_path
+    local source_path
+
+    for configured_path in "$SHARED_FILE" "$LOCAL_FILE" "$OUTPUT_FILE"; do
+        case "$configured_path" in
+            /*) ;;
+            *) die "configured paths must be absolute: $configured_path" ;;
+        esac
+    done
+
+    if [[ "$SHARED_FILE" == "$LOCAL_FILE" ]]; then
+        die "the shared and local source paths must be different"
+    fi
+
+    if [[ "$OUTPUT_FILE" == "$SHARED_FILE" || "$OUTPUT_FILE" == "$LOCAL_FILE" ]]; then
+        die "the generated file must be different from both source files"
+    fi
+
+    for source_path in "$SHARED_FILE" "$LOCAL_FILE"; do
+        if is_harness_path "$source_path"; then
+            die "a source file cannot use a managed harness path: $source_path"
+        fi
+    done
+
+    if is_harness_path "$OUTPUT_FILE"; then
+        die "the generated file cannot use a managed harness path: $OUTPUT_FILE"
+    fi
+}
+
+is_harness_path() {
+    local file_path="$1"
+
+    case "$file_path" in
+        "$HOME/.copilot/copilot-instructions.md"|\
+        "$HOME/.claude/CLAUDE.md"|\
+        "$HOME/.codex/AGENTS.md"|\
+        "$HOME/.pi/agent/AGENTS.md")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+validate_sources() {
+    local failed=0
+
+    if [[ ! -f "$SHARED_FILE" || ! -r "$SHARED_FILE" ]]; then
+        printf 'error: shared source is missing or unreadable: %s\n' "$(display_path "$SHARED_FILE")" >&2
+        failed=1
+    fi
+
+    if [[ ! -f "$LOCAL_FILE" || ! -r "$LOCAL_FILE" ]]; then
+        printf 'error: local source is missing or unreadable: %s\n' "$(display_path "$LOCAL_FILE")" >&2
+        failed=1
+    fi
+
+    [[ "$failed" -eq 0 ]]
+}
+
+write_candidate() {
+    local destination="$1"
+
+    {
+        printf '<!-- Generated by agentsmd. Do not edit directly.\n'
+        printf 'Edit ~/AGENTS.shared.md for shared instructions or ~/AGENTS.local.md for machine-specific or sensitive instructions.\n'
+        printf 'Version the source files, not this file. -->\n\n'
+        cat "$SHARED_FILE"
+        printf '\n\n'
+        cat "$LOCAL_FILE"
+        printf '\n'
+    } >"$destination"
+}
+
+confirm_apply() {
+    local answer
+
+    cat <<'EOF'
+
+Do you want to perform these actions?
+  agentsmd will apply the changes described above.
+  Only "yes" will be accepted to approve.
+
+EOF
+    printf 'Enter a value: '
+    IFS= read -r answer || answer=""
+
+    [[ "$answer" == "yes" ]]
+}
+
+show_build_diff() {
+    local candidate="$1"
+    local plan_dir="$2"
+    local diff_status
+
+    mkdir -p "$plan_dir/current" "$plan_dir/proposed"
+    cp "$candidate" "$plan_dir/proposed/AGENTS.md"
+
+    if [[ -f "$OUTPUT_FILE" ]]; then
+        cp "$OUTPUT_FILE" "$plan_dir/current/AGENTS.md"
+        if (
+            cd "$plan_dir"
+            git --no-pager diff --no-index --no-ext-diff --text --no-prefix -- current/AGENTS.md proposed/AGENTS.md
+        ); then
+            diff_status=0
+        else
+            diff_status=$?
+        fi
+    else
+        : >"$plan_dir/current/AGENTS.md"
+        if (
+            cd "$plan_dir"
+            git --no-pager diff --no-index --no-ext-diff --text --no-prefix -- current/AGENTS.md proposed/AGENTS.md
+        ); then
+            diff_status=0
+        else
+            diff_status=$?
+        fi
+    fi
+
+    if [[ "$diff_status" -gt 1 ]]; then
+        die "git diff --no-index failed with exit code $diff_status"
+    fi
+}
+
+output_is_current() {
+    local candidate="$1"
+
+    [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]] && cmp -s "$OUTPUT_FILE" "$candidate"
+}
+
+command_build() {
+    local workspace
+    local candidate
+    local plan_dir
+    local output_mode=""
+    local content_change=0
+    local permission_change=0
+    local output_temp
+    local backup_file=""
+    local backup_timestamp=""
+
+    validate_sources || exit 1
+    command -v git >/dev/null 2>&1 || die "git is required to show the build diff"
+
+    workspace="$(new_temp_dir)"
+    TEMP_PATHS+=("$workspace")
+    candidate="$workspace/AGENTS.md"
+    plan_dir="$workspace/plan"
+    write_candidate "$candidate"
+
+    if ! output_is_current "$candidate"; then
+        content_change=1
+    fi
+
+    if [[ -e "$OUTPUT_FILE" && ! -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+        die "generated path exists but is not a file: $(display_path "$OUTPUT_FILE")"
+    fi
+
+    if [[ -e "$OUTPUT_DIR" && ! -d "$OUTPUT_DIR" ]]; then
+        die "generated directory path exists but is not a directory: $(display_path "$OUTPUT_DIR")"
+    fi
+
+    if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+        output_mode="$(file_mode "$OUTPUT_FILE" || true)"
+        if [[ "$output_mode" != "600" || -L "$OUTPUT_FILE" ]]; then
+            permission_change=1
+        fi
+    fi
+
+    if [[ "$content_change" -eq 0 && "$permission_change" -eq 0 ]]; then
+        printf 'No changes. %s is up to date.\n' "$(display_path "$OUTPUT_FILE")"
+        return
+    fi
+
+    printf 'agentsmd will perform the following actions:\n\n'
+
+    if [[ ! -e "$OUTPUT_DIR" ]]; then
+        printf '  create %s with permissions 0700\n' "$(display_path "$OUTPUT_DIR")"
+    fi
+
+    if [[ ! -e "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+        printf '  create %s with permissions 0600\n' "$(display_path "$OUTPUT_FILE")"
+    elif [[ -L "$OUTPUT_FILE" ]]; then
+        printf '  back up and replace %s -> %s\n' \
+            "$(display_path "$OUTPUT_FILE")" "$(display_path "$(readlink "$OUTPUT_FILE")")"
+    elif [[ "$content_change" -eq 1 ]]; then
+        printf '  back up and update %s\n' "$(display_path "$OUTPUT_FILE")"
+    fi
+
+    if [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+        if [[ "$output_mode" != "600" ]]; then
+            printf '  set %s permissions to 0600\n' "$(display_path "$OUTPUT_FILE")"
+        fi
+    fi
+
+    printf '\nProposed content changes:\n\n'
+    if [[ "$content_change" -eq 1 ]]; then
+        show_build_diff "$candidate" "$plan_dir"
+    else
+        printf '  No content changes.\n'
+    fi
+
+    if ! confirm_apply; then
+        printf '\nBuild cancelled. No files were changed.\n'
+        return
+    fi
+
+    if [[ ! -e "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+        chmod 700 "$OUTPUT_DIR"
+    fi
+
+    if [[ "$content_change" -eq 1 ]]; then
+        if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+            mkdir -p "$BACKUP_HOME"
+            chmod 700 "$(dirname "$BACKUP_HOME")" "$BACKUP_HOME"
+            backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            backup_file="$(backup_item "$OUTPUT_FILE" "$backup_timestamp")"
+        fi
+
+        output_temp="$(mktemp "$OUTPUT_DIR/.AGENTS.md.XXXXXX")"
+        TEMP_PATHS+=("$output_temp")
+        cp "$candidate" "$output_temp"
+        chmod 600 "$output_temp"
+        mv -f "$output_temp" "$OUTPUT_FILE"
+    else
+        chmod 600 "$OUTPUT_FILE"
+    fi
+
+    if [[ -n "$backup_file" ]]; then
+        printf '\nBackup: %s\n' "$(display_path "$backup_file")"
+    fi
+    printf '\nBuilt %s.\n' "$(display_path "$OUTPUT_FILE")"
+}
+
+command_status() {
+    local workspace
+    local candidate
+    local sources_ready=0
+    local link_index
+    local link_path
+    local link_target
+    local link_names=(
+        "Copilot"
+        "Claude"
+        "Codex"
+        "Pi"
+    )
+    local link_paths=(
+        "$HOME/.copilot/copilot-instructions.md"
+        "$HOME/.claude/CLAUDE.md"
+        "$HOME/.codex/AGENTS.md"
+        "$HOME/.pi/agent/AGENTS.md"
+    )
+
+    printf 'Sources\n'
+    if [[ -f "$SHARED_FILE" && -r "$SHARED_FILE" ]]; then
+        printf '✅ Shared: %s\n' "$(display_path "$SHARED_FILE")"
+    else
+        printf 'ℹ️  Shared not defined: %s\n' "$(display_path "$SHARED_FILE")"
+    fi
+
+    if [[ -f "$LOCAL_FILE" && -r "$LOCAL_FILE" ]]; then
+        printf '✅ Local:  %s\n' "$(display_path "$LOCAL_FILE")"
+    else
+        printf 'ℹ️  Local not defined:  %s\n' "$(display_path "$LOCAL_FILE")"
+    fi
+
+    if [[ -f "$SHARED_FILE" && -r "$SHARED_FILE" && \
+          -f "$LOCAL_FILE" && -r "$LOCAL_FILE" ]]; then
+        sources_ready=1
+    fi
+
+    printf '\nGenerated\n'
+    if [[ "$sources_ready" -eq 1 ]]; then
+        workspace="$(new_temp_dir)"
+        TEMP_PATHS+=("$workspace")
+        candidate="$workspace/AGENTS.md"
+        write_candidate "$candidate"
+
+        if output_is_current "$candidate"; then
+            printf '✅ Current: %s\n' "$(display_path "$OUTPUT_FILE")"
+        elif [[ -L "$OUTPUT_FILE" ]]; then
+            printf '⚠️  Stale: %s -> %s\n' \
+                "$(display_path "$OUTPUT_FILE")" "$(display_path "$(readlink "$OUTPUT_FILE")")"
+        elif [[ -e "$OUTPUT_FILE" ]]; then
+            printf '⚠️  Stale: %s\n' "$(display_path "$OUTPUT_FILE")"
+        else
+            printf '❌ Missing: %s\n' "$(display_path "$OUTPUT_FILE")"
+        fi
+    elif [[ -L "$OUTPUT_FILE" ]]; then
+        printf '❓ Unknown: %s -> %s (source files are not defined)\n' \
+            "$(display_path "$OUTPUT_FILE")" "$(display_path "$(readlink "$OUTPUT_FILE")")"
+    elif [[ -e "$OUTPUT_FILE" ]]; then
+        printf '❓ Unknown: %s (source files are not defined)\n' "$(display_path "$OUTPUT_FILE")"
+    else
+        printf '❌ Missing: %s\n' "$(display_path "$OUTPUT_FILE")"
+    fi
+
+    printf '\nHarness symlinks\n'
+    for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++)); do
+        link_path="${link_paths[$link_index]}"
+        if [[ -L "$link_path" ]]; then
+            link_target="$(readlink "$link_path")"
+            if [[ "$link_target" == "$OUTPUT_FILE" ]]; then
+                printf '✅ %s: %s -> %s\n' \
+                    "${link_names[$link_index]}" "$(display_path "$link_path")" "$(display_path "$link_target")"
+            else
+                printf '⚠️  %s: %s -> %s (expected -> %s)\n' \
+                    "${link_names[$link_index]}" "$(display_path "$link_path")" \
+                    "$(display_path "$link_target")" "$(display_path "$OUTPUT_FILE")"
+            fi
+        elif [[ -e "$link_path" ]]; then
+            printf '⚠️  %s: %s is not a symlink (expected -> %s)\n' \
+                "${link_names[$link_index]}" "$(display_path "$link_path")" "$(display_path "$OUTPUT_FILE")"
+        else
+            printf '❌ %s: %s is missing (expected -> %s)\n' \
+                "${link_names[$link_index]}" "$(display_path "$link_path")" "$(display_path "$OUTPUT_FILE")"
+        fi
+    done
+}
+
+backup_item() {
+    local source_path="$1"
+    local timestamp="$2"
+    local relative_path="${source_path#"$HOME"/}"
+    local destination="$BACKUP_HOME/$relative_path.$timestamp.bak"
+    local collision=2
+
+    while [[ -e "$destination" || -L "$destination" ]]; do
+        destination="$BACKUP_HOME/$relative_path.$timestamp-$collision.bak"
+        collision=$((collision + 1))
+    done
+
+    mkdir -p "$(dirname "$destination")"
+    cp -a "$source_path" "$destination"
+    printf '%s' "$destination"
+}
+
+command_install() {
+    local link_index
+    local link_path
+    local link_target
+    local changes=0
+    local backup_file
+    local backup_timestamp=""
+    local backups_started=0
+    local link_names=(
+        "Copilot"
+        "Claude"
+        "Codex"
+        "Pi"
+    )
+    local link_paths=(
+        "$HOME/.copilot/copilot-instructions.md"
+        "$HOME/.claude/CLAUDE.md"
+        "$HOME/.codex/AGENTS.md"
+        "$HOME/.pi/agent/AGENTS.md"
+    )
+
+    if [[ ! -f "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+        die "generated file is missing; run: $PROGRAM_NAME build"
+    fi
+
+    printf 'agentsmd will perform the following actions:\n\n'
+
+    for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++)); do
+        link_path="${link_paths[$link_index]}"
+
+        if [[ -L "$link_path" ]]; then
+            link_target="$(readlink "$link_path")"
+            if [[ "$link_target" == "$OUTPUT_FILE" ]]; then
+                continue
+            fi
+        elif [[ -d "$link_path" ]]; then
+            die "refusing to replace directory: $(display_path "$link_path")"
+        fi
+
+        changes=$((changes + 1))
+        if [[ -e "$link_path" || -L "$link_path" ]]; then
+            printf '  back up and replace %s for %s\n' "$(display_path "$link_path")" "${link_names[$link_index]}"
+        else
+            printf '  create %s for %s\n' "$(display_path "$link_path")" "${link_names[$link_index]}"
+        fi
+    done
+
+    if [[ "$changes" -eq 0 ]]; then
+        printf '  No changes. All harness links are installed.\n'
+        return
+    fi
+
+    printf '\nEvery link will point directly to %s.\n' "$(display_path "$OUTPUT_FILE")"
+
+    if ! confirm_apply; then
+        printf '\nInstall cancelled. No files were changed.\n'
+        return
+    fi
+
+    for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++)); do
+        link_path="${link_paths[$link_index]}"
+
+        if [[ -L "$link_path" ]]; then
+            link_target="$(readlink "$link_path")"
+            if [[ "$link_target" == "$OUTPUT_FILE" ]]; then
+                continue
+            fi
+        fi
+
+        mkdir -p "$(dirname "$link_path")"
+
+        if [[ -e "$link_path" || -L "$link_path" ]]; then
+            if [[ -z "$backup_timestamp" ]]; then
+                mkdir -p "$BACKUP_HOME"
+                chmod 700 "$(dirname "$BACKUP_HOME")" "$BACKUP_HOME"
+                backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            fi
+            backup_file="$(backup_item "$link_path" "$backup_timestamp")"
+            if [[ "$backups_started" -eq 0 ]]; then
+                printf '\nBackups:\n'
+                backups_started=1
+            fi
+            printf '  %s\n' "$(display_path "$backup_file")"
+            rm "$link_path"
+        fi
+
+        ln -s "$OUTPUT_FILE" "$link_path"
+    done
+
+    printf 'Installed harness links.\n'
+}
+
+main() {
+    local command="${1:-help}"
+
+    validate_paths
+
+    if [[ "$#" -gt 1 ]]; then
+        die "unexpected argument: $2"
+    fi
+
+    case "$command" in
+        status)
+            command_status
+            ;;
+        build)
+            command_build
+            ;;
+        install)
+            command_install
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            printf 'error: unknown command: %s\n\n' "$command" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
