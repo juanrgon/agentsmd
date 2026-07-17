@@ -9,6 +9,16 @@ LOCAL_FILE="${AGENTSMD_LOCAL_FILE:-$HOME/AGENTS.local.md}"
 OUTPUT_FILE="${AGENTSMD_OUTPUT_FILE:-$HOME/AGENTS.md}"
 OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"
 BACKUP_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/agentsmd/backups"
+SERVICE_LABEL="com.juanrgon.agentsmd"
+SERVICE_PLIST="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+SERVICE_STATE_HOME="${AGENTSMD_STATE_HOME:-$HOME/Library/Application Support/agentsmd}"
+SERVICE_HISTORY_FILE="$SERVICE_STATE_HOME/history.tsv"
+SERVICE_LOG_HOME="${AGENTSMD_LOG_HOME:-$HOME/Library/Logs/agentsmd}"
+SERVICE_OUTPUT_LOG="$SERVICE_LOG_HOME/service.log"
+SERVICE_ERROR_LOG="$SERVICE_LOG_HOME/service.error.log"
+SERVICE_RUN_ACTIVE=0
+SERVICE_RUN_COMPLETED=0
+SERVICE_RUN_FAILURE_MESSAGE="service build failed"
 
 # Bash 3.2 treats an empty array as unset under `set -u`. Keep an empty
 # sentinel so cleanup is safe before the first temporary path is registered.
@@ -28,7 +38,21 @@ cleanup() {
     done
 }
 
-trap cleanup EXIT
+finish() {
+    local exit_status="$1"
+
+    trap - EXIT
+
+    if [[ "$SERVICE_RUN_ACTIVE" -eq 1 && "$SERVICE_RUN_COMPLETED" -eq 0 ]]; then
+        record_service_history "error" "failed" \
+            "$SERVICE_RUN_FAILURE_MESSAGE (exit $exit_status; see $(display_path "$SERVICE_ERROR_LOG"))" || true
+    fi
+
+    cleanup
+    exit "$exit_status"
+}
+
+trap 'finish $?' EXIT
 trap 'exit 130' HUP INT TERM
 
 usage() {
@@ -42,6 +66,7 @@ Commands:
   status   Show the source files, generated file freshness, and harness links
   build    Show the proposed AGENTS.md diff and apply it after approval
   install  Create or repair the Copilot, Claude Code, Codex, and Pi links
+  service  Manage automatic background builds on macOS
   help     Show this help text
 
 Files:
@@ -49,6 +74,7 @@ Files:
   Local source:   $(display_path "$LOCAL_FILE")
   Generated file: $(display_path "$OUTPUT_FILE")
   Backups:        $(display_path "$BACKUP_HOME")
+  Service state:  $(display_path "$SERVICE_STATE_HOME")
 
 The generated file is local build output. It may contain private local
 instructions, so agentsmd writes it with owner-only permissions.
@@ -58,6 +84,7 @@ Typical workflow:
   2. Run "$PROGRAM_NAME build" and review the proposed diff.
   3. Run "$PROGRAM_NAME install" once to connect the supported harnesses.
   4. Run "$PROGRAM_NAME status" whenever you want to check for drift.
+  5. Optionally run "$PROGRAM_NAME service install" for automatic builds.
 
 The build command combines AGENTS.shared.md followed by AGENTS.local.md. It
 shows the proposed change with "git diff --no-index" and only applies it after
@@ -67,17 +94,58 @@ The install command points each supported harness directly at the generated
 file. It backs up every file or link that it replaces and also requires you to
 enter "yes".
 
+The service command manages a macOS LaunchAgent that rebuilds the generated
+file at login and whenever either source file changes. Run
+"$PROGRAM_NAME service help" to see its commands. Services are not supported
+on Linux or Windows.
+
 Optional environment variables:
   AGENTSMD_SHARED_FILE  Override the shared source path
   AGENTSMD_LOCAL_FILE   Override the local source path
   AGENTSMD_OUTPUT_FILE  Override the generated file path
+  AGENTSMD_STATE_HOME   Override the service history directory
+  AGENTSMD_LOG_HOME     Override the service log directory
   XDG_CACHE_HOME        Override the default backup directory
 
 None of these commands pull, push, commit, or make network requests.
 EOF
 }
 
+service_usage() {
+    cat <<EOF
+Manage automatic AGENTS.md builds with a macOS LaunchAgent.
+
+Usage:
+  $PROGRAM_NAME service <command>
+
+Commands:
+  install          Install, load, and start the LaunchAgent
+  status           Show whether the service is installed and loaded
+  history [count]  Show recent unattended build results (default: 20)
+  doctor           Check the service configuration and dependencies
+  start            Load the service or trigger a build now
+  stop             Disable and unload the service until it is started again
+  restart          Reload or trigger the service
+  run              Run one unattended build (normally called by launchd)
+  uninstall        Unload and remove the LaunchAgent
+  help             Show this help text
+
+Files:
+  LaunchAgent:  $(display_path "$SERVICE_PLIST")
+  History:      $(display_path "$SERVICE_HISTORY_FILE")
+  Output log:   $(display_path "$SERVICE_OUTPUT_LOG")
+  Error log:    $(display_path "$SERVICE_ERROR_LOG")
+
+The LaunchAgent runs once when it loads and watches both source files for
+changes. Rapid changes are coalesced. Unattended builds are atomic and do not
+show a diff or ask for approval.
+EOF
+}
+
 die() {
+    if [[ "$SERVICE_RUN_ACTIVE" -eq 1 ]]; then
+        SERVICE_RUN_FAILURE_MESSAGE="$*"
+    fi
     printf 'error: %s\n' "$*" >&2
     exit 1
 }
@@ -122,6 +190,55 @@ file_mode() {
     return 1
 }
 
+file_owner() {
+    local file_path="$1"
+    local owner
+
+    if owner="$(stat -f '%u' "$file_path" 2>/dev/null)"; then
+        printf '%s' "$owner"
+        return
+    fi
+
+    if owner="$(stat -c '%u' "$file_path" 2>/dev/null)"; then
+        printf '%s' "$owner"
+        return
+    fi
+
+    return 1
+}
+
+ensure_private_directory() {
+    local directory_path="$1"
+    local description="$2"
+
+    if [[ -L "$directory_path" || \
+          ( -e "$directory_path" && ! -d "$directory_path" ) ]]; then
+        die "$description is not a directory: $(display_path "$directory_path")"
+    fi
+
+    mkdir -p "$directory_path"
+    chmod 700 "$directory_path"
+}
+
+ensure_private_file() {
+    local file_path="$1"
+    local description="$2"
+
+    if [[ -L "$file_path" || ( -e "$file_path" && ! -f "$file_path" ) ]]; then
+        die "$description is not a regular file: $(display_path "$file_path")"
+    fi
+
+    if [[ ! -e "$file_path" ]]; then
+        : >"$file_path"
+    fi
+    chmod 600 "$file_path"
+}
+
+ensure_backup_home() {
+    mkdir -p "$BACKUP_HOME"
+    chmod 700 "$(dirname "$BACKUP_HOME")" "$BACKUP_HOME"
+}
+
 validate_paths() {
     local configured_path
     local source_path
@@ -150,6 +267,22 @@ validate_paths() {
     if is_harness_path "$OUTPUT_FILE"; then
         die "the generated file cannot use a managed harness path: $OUTPUT_FILE"
     fi
+}
+
+validate_service_paths() {
+    local configured_path
+
+    for configured_path in \
+        "$SERVICE_PLIST" "$SERVICE_STATE_HOME" "$SERVICE_LOG_HOME" "$BACKUP_HOME"; do
+        case "$configured_path" in
+            /*) ;;
+            *) die "configured service paths must be absolute: $configured_path" ;;
+        esac
+
+        case "$configured_path" in
+            *$'\n'*|*$'\r'*) die "configured service paths cannot contain line breaks" ;;
+        esac
+    done
 }
 
 is_harness_path() {
@@ -255,6 +388,361 @@ output_is_current() {
     [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]] && cmp -s "$OUTPUT_FILE" "$candidate"
 }
 
+require_macos() {
+    local operating_system
+
+    operating_system="$(uname -s 2>/dev/null || true)"
+    if [[ "$operating_system" != "Darwin" ]]; then
+        if [[ -z "$operating_system" ]]; then
+            operating_system="unknown"
+        fi
+        die "the service command is only supported on macOS (detected: $operating_system)"
+    fi
+}
+
+service_domain() {
+    printf 'gui/%s' "$(id -u)"
+}
+
+service_target() {
+    printf '%s/%s' "$(service_domain)" "$SERVICE_LABEL"
+}
+
+service_program_path() {
+    local program_path="${BASH_SOURCE[0]}"
+    local program_dir
+
+    case "$program_path" in
+        /*) ;;
+        */*) program_path="$PWD/$program_path" ;;
+        *) program_path="$(command -v "$program_path" 2>/dev/null || true)" ;;
+    esac
+
+    [[ -n "$program_path" ]] || die "could not find the agentsmd executable"
+    program_dir="$(cd -P "$(dirname "$program_path")" && pwd)"
+    printf '%s/%s' "$program_dir" "$(basename "$program_path")"
+}
+
+xml_escape() {
+    LC_ALL=C sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&apos;/g"
+}
+
+resolve_path() {
+    local file_path="$1"
+    local link_target
+    local path_dir
+    local link_count=0
+
+    while [[ -L "$file_path" ]]; do
+        link_count=$((link_count + 1))
+        if [[ "$link_count" -gt 40 ]]; then
+            return 1
+        fi
+
+        link_target="$(readlink "$file_path")" || return 1
+        case "$link_target" in
+            /*) file_path="$link_target" ;;
+            *) file_path="$(dirname "$file_path")/$link_target" ;;
+        esac
+    done
+
+    path_dir="$(cd -P "$(dirname "$file_path")" 2>/dev/null && pwd)" || return 1
+    printf '%s/%s' "$path_dir" "$(basename "$file_path")"
+}
+
+write_service_watch_paths() {
+    local source_path
+    local resolved_path
+    local normalized_source_path
+    local known_path
+    local duplicate
+    local candidate_paths=("$SHARED_FILE" "$LOCAL_FILE")
+    local unique_paths=("")
+
+    for source_path in "$SHARED_FILE" "$LOCAL_FILE"; do
+        resolved_path="$(resolve_path "$source_path" || true)"
+        normalized_source_path="$(
+            cd -P "$(dirname "$source_path")" 2>/dev/null && \
+                printf '%s/%s' "$PWD" "$(basename "$source_path")"
+        )" || normalized_source_path="$source_path"
+        if [[ -n "$resolved_path" && "$resolved_path" != "$normalized_source_path" ]]; then
+            candidate_paths+=("$resolved_path")
+        fi
+    done
+
+    for source_path in "${candidate_paths[@]}"; do
+        duplicate=0
+        for known_path in "${unique_paths[@]}"; do
+            if [[ -n "$known_path" && "$known_path" == "$source_path" ]]; then
+                duplicate=1
+                break
+            fi
+        done
+        if [[ "$duplicate" -eq 1 ]]; then
+            continue
+        fi
+
+        unique_paths+=("$source_path")
+        printf '        <string>%s</string>\n' \
+            "$(printf '%s' "$source_path" | xml_escape)"
+    done
+}
+
+write_service_plist() {
+    local destination="$1"
+    local program_path
+    local cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+    program_path="$(service_program_path)"
+
+    cat >"$destination" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$(printf '%s' "$SERVICE_LABEL" | xml_escape)</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$(printf '%s' "$program_path" | xml_escape)</string>
+        <string>service</string>
+        <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$(printf '%s' "$HOME" | xml_escape)</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>AGENTSMD_SHARED_FILE</key>
+        <string>$(printf '%s' "$SHARED_FILE" | xml_escape)</string>
+        <key>AGENTSMD_LOCAL_FILE</key>
+        <string>$(printf '%s' "$LOCAL_FILE" | xml_escape)</string>
+        <key>AGENTSMD_OUTPUT_FILE</key>
+        <string>$(printf '%s' "$OUTPUT_FILE" | xml_escape)</string>
+        <key>AGENTSMD_STATE_HOME</key>
+        <string>$(printf '%s' "$SERVICE_STATE_HOME" | xml_escape)</string>
+        <key>AGENTSMD_LOG_HOME</key>
+        <string>$(printf '%s' "$SERVICE_LOG_HOME" | xml_escape)</string>
+        <key>XDG_CACHE_HOME</key>
+        <string>$(printf '%s' "$cache_home" | xml_escape)</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WatchPaths</key>
+    <array>
+$(write_service_watch_paths)
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>$(printf '%s' "$SERVICE_OUTPUT_LOG" | xml_escape)</string>
+    <key>StandardErrorPath</key>
+    <string>$(printf '%s' "$SERVICE_ERROR_LOG" | xml_escape)</string>
+</dict>
+</plist>
+EOF
+}
+
+record_service_history() {
+    local status="$1"
+    local action="$2"
+    local details="$3"
+    local timestamp
+
+    if [[ -L "$SERVICE_STATE_HOME" || \
+          ( -e "$SERVICE_STATE_HOME" && ! -d "$SERVICE_STATE_HOME" ) ]]; then
+        printf 'error: service state path is not a directory: %s\n' \
+            "$(display_path "$SERVICE_STATE_HOME")" >&2
+        return 1
+    fi
+
+    mkdir -p "$SERVICE_STATE_HOME"
+    chmod 700 "$SERVICE_STATE_HOME"
+
+    if [[ -L "$SERVICE_HISTORY_FILE" || \
+          ( -e "$SERVICE_HISTORY_FILE" && ! -f "$SERVICE_HISTORY_FILE" ) ]]; then
+        printf 'error: service history path is not a regular file: %s\n' \
+            "$(display_path "$SERVICE_HISTORY_FILE")" >&2
+        return 1
+    fi
+
+    details="${details//$'\t'/ }"
+    details="${details//$'\r'/ }"
+    details="${details//$'\n'/ }"
+    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '%s\t%s\t%s\t%s\n' "$timestamp" "$status" "$action" "$details" \
+        >>"$SERVICE_HISTORY_FILE"
+    chmod 600 "$SERVICE_HISTORY_FILE"
+}
+
+acquire_service_lock() {
+    local lock_dir="$SERVICE_STATE_HOME/run.lock"
+    local lock_pid=""
+    local current_uid
+    local lock_owner=""
+
+    current_uid="$(id -u)"
+
+    mkdir -p "$SERVICE_STATE_HOME"
+    chmod 700 "$SERVICE_STATE_HOME"
+
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" >"$lock_dir/pid"
+        TEMP_PATHS+=("$lock_dir")
+        return 0
+    fi
+
+    if [[ -L "$lock_dir" || ! -d "$lock_dir" ]]; then
+        die "service lock path is unsafe: $(display_path "$lock_dir")"
+    fi
+    lock_owner="$(file_owner "$lock_dir" || true)"
+    if [[ "$lock_owner" != "$current_uid" ]]; then
+        die "service lock is not owned by the current user: $(display_path "$lock_dir")"
+    fi
+
+    if [[ -f "$lock_dir/pid" && ! -L "$lock_dir/pid" ]]; then
+        IFS= read -r lock_pid <"$lock_dir/pid" || lock_pid=""
+    fi
+
+    case "$lock_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                record_service_history "ok" "skipped" \
+                    "Another service build is already running with PID $lock_pid."
+                SERVICE_RUN_COMPLETED=1
+                printf 'Skipped service build because PID %s is already running.\n' "$lock_pid"
+                return 1
+            fi
+            ;;
+    esac
+
+    if [[ -e "$lock_dir/pid" || -L "$lock_dir/pid" ]]; then
+        rm "$lock_dir/pid"
+    fi
+    if ! rmdir "$lock_dir"; then
+        die "could not remove stale service lock: $(display_path "$lock_dir")"
+    fi
+    if ! mkdir "$lock_dir"; then
+        die "could not acquire service lock: $(display_path "$lock_dir")"
+    fi
+
+    printf '%s\n' "$$" >"$lock_dir/pid"
+    TEMP_PATHS+=("$lock_dir")
+}
+
+command_service_run() {
+    local workspace
+    local candidate
+    local output_mode=""
+    local content_change=0
+    local permission_change=0
+    local output_temp
+    local backup_file=""
+    local backup_timestamp=""
+    local result_action="unchanged"
+    local result_details
+
+    require_macos
+    SERVICE_RUN_ACTIVE=1
+    SERVICE_RUN_FAILURE_MESSAGE="unattended build failed"
+
+    if ! validate_sources; then
+        SERVICE_RUN_FAILURE_MESSAGE="source files are missing or unreadable"
+        return 1
+    fi
+
+    if ! acquire_service_lock; then
+        return 0
+    fi
+
+    workspace="$(new_temp_dir)"
+    TEMP_PATHS+=("$workspace")
+    candidate="$workspace/AGENTS.md"
+    write_candidate "$candidate"
+
+    if ! output_is_current "$candidate"; then
+        content_change=1
+    fi
+
+    if [[ -e "$OUTPUT_FILE" && ! -f "$OUTPUT_FILE" ]]; then
+        die "generated path exists but is not a file: $(display_path "$OUTPUT_FILE")"
+    fi
+    if [[ -e "$OUTPUT_DIR" && ! -d "$OUTPUT_DIR" ]]; then
+        die "generated directory path exists but is not a directory: $(display_path "$OUTPUT_DIR")"
+    fi
+
+    if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+        output_mode="$(file_mode "$OUTPUT_FILE" || true)"
+        if [[ "$output_mode" != "600" || -L "$OUTPUT_FILE" ]]; then
+            permission_change=1
+        fi
+    fi
+
+    if [[ "$content_change" -eq 0 && "$permission_change" -eq 0 ]]; then
+        if [[ "$(file_owner "$OUTPUT_FILE" || true)" == "$(id -u)" ]]; then
+            result_details="$(display_path "$OUTPUT_FILE") was already current."
+            record_service_history "ok" "$result_action" "$result_details"
+            SERVICE_RUN_COMPLETED=1
+            printf 'No changes. %s is up to date.\n' "$(display_path "$OUTPUT_FILE")"
+            return
+        fi
+        die "generated file is not owned by the current user: $(display_path "$OUTPUT_FILE")"
+    fi
+
+    if [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+        if [[ "$(file_owner "$OUTPUT_FILE" || true)" != "$(id -u)" ]]; then
+            die "generated file is not owned by the current user: $(display_path "$OUTPUT_FILE")"
+        fi
+    fi
+
+    if [[ ! -e "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR"
+        chmod 700 "$OUTPUT_DIR"
+    fi
+
+    if [[ "$content_change" -eq 1 ]]; then
+        output_temp="$(mktemp "$OUTPUT_DIR/.AGENTS.md.XXXXXX")"
+        TEMP_PATHS+=("$output_temp")
+        cp "$candidate" "$output_temp"
+        chmod 600 "$output_temp"
+
+        if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+            ensure_backup_home
+            backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            backup_file="$(backup_item "$OUTPUT_FILE" "$backup_timestamp")"
+        fi
+
+        mv -f "$output_temp" "$OUTPUT_FILE"
+        result_action="built"
+        result_details="Updated $(display_path "$OUTPUT_FILE")."
+        if [[ -n "$backup_file" ]]; then
+            result_details="$result_details Backup: $(display_path "$backup_file")."
+        fi
+    else
+        chmod 600 "$OUTPUT_FILE"
+        result_action="permissions"
+        result_details="Set $(display_path "$OUTPUT_FILE") permissions to 0600."
+    fi
+
+    record_service_history "ok" "$result_action" "$result_details"
+    SERVICE_RUN_COMPLETED=1
+    printf '%s\n' "$result_details"
+}
+
 command_build() {
     local workspace
     local candidate
@@ -279,7 +767,7 @@ command_build() {
         content_change=1
     fi
 
-    if [[ -e "$OUTPUT_FILE" && ! -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]]; then
+    if [[ -e "$OUTPUT_FILE" && ! -f "$OUTPUT_FILE" ]]; then
         die "generated path exists but is not a file: $(display_path "$OUTPUT_FILE")"
     fi
 
@@ -338,17 +826,17 @@ command_build() {
     fi
 
     if [[ "$content_change" -eq 1 ]]; then
-        if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
-            mkdir -p "$BACKUP_HOME"
-            chmod 700 "$(dirname "$BACKUP_HOME")" "$BACKUP_HOME"
-            backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-            backup_file="$(backup_item "$OUTPUT_FILE" "$backup_timestamp")"
-        fi
-
         output_temp="$(mktemp "$OUTPUT_DIR/.AGENTS.md.XXXXXX")"
         TEMP_PATHS+=("$output_temp")
         cp "$candidate" "$output_temp"
         chmod 600 "$output_temp"
+
+        if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+            ensure_backup_home
+            backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            backup_file="$(backup_item "$OUTPUT_FILE" "$backup_timestamp")"
+        fi
+
         mv -f "$output_temp" "$OUTPUT_FILE"
     else
         chmod 600 "$OUTPUT_FILE"
@@ -537,8 +1025,7 @@ command_install() {
 
         if [[ -e "$link_path" || -L "$link_path" ]]; then
             if [[ -z "$backup_timestamp" ]]; then
-                mkdir -p "$BACKUP_HOME"
-                chmod 700 "$(dirname "$BACKUP_HOME")" "$BACKUP_HOME"
+                ensure_backup_home
                 backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
             fi
             backup_file="$(backup_item "$link_path" "$backup_timestamp")"
@@ -556,12 +1043,543 @@ command_install() {
     printf 'Installed harness links.\n'
 }
 
+service_is_loaded() {
+    launchctl print "$(service_target)" >/dev/null 2>&1
+}
+
+command_service_install() {
+    local plist_dir
+    local plist_temp
+    local plist_mode=""
+    local workspace
+    local proposed_plist
+    local plist_change=1
+    local was_loaded=0
+    local plist_owner=""
+    local current_uid
+    local program_path
+
+    current_uid="$(id -u)"
+
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
+    command -v plutil >/dev/null 2>&1 || die "plutil is required"
+    validate_sources || exit 1
+    program_path="$(service_program_path)"
+    if [[ ! -f "$program_path" || ! -x "$program_path" ]]; then
+        die "agentsmd executable is missing or not executable: $(display_path "$program_path")"
+    fi
+
+    plist_dir="$(dirname "$SERVICE_PLIST")"
+    if [[ -L "$plist_dir" || ( -e "$plist_dir" && ! -d "$plist_dir" ) ]]; then
+        die "LaunchAgents path is not a directory: $(display_path "$plist_dir")"
+    fi
+    if [[ -e "$SERVICE_PLIST" || -L "$SERVICE_PLIST" ]]; then
+        if [[ ! -f "$SERVICE_PLIST" || -L "$SERVICE_PLIST" ]]; then
+            die "LaunchAgent path is not a regular file: $(display_path "$SERVICE_PLIST")"
+        fi
+    fi
+
+    ensure_private_directory "$SERVICE_LOG_HOME" "service log path"
+    ensure_private_directory "$SERVICE_STATE_HOME" "service state path"
+    ensure_private_file "$SERVICE_OUTPUT_LOG" "service output log"
+    ensure_private_file "$SERVICE_ERROR_LOG" "service error log"
+
+    workspace="$(new_temp_dir)"
+    TEMP_PATHS+=("$workspace")
+    proposed_plist="$workspace/$SERVICE_LABEL.plist"
+    write_service_plist "$proposed_plist"
+    plutil -lint "$proposed_plist" >/dev/null
+
+    if [[ -f "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]] && \
+       cmp -s "$SERVICE_PLIST" "$proposed_plist"; then
+        plist_change=0
+        plist_mode="$(file_mode "$SERVICE_PLIST" || true)"
+        plist_owner="$(file_owner "$SERVICE_PLIST" || true)"
+    fi
+
+    if service_is_loaded; then
+        was_loaded=1
+    fi
+
+    if [[ "$plist_change" -eq 0 && "$plist_mode" == "600" && \
+          "$plist_owner" == "$current_uid" && "$was_loaded" -eq 1 ]]; then
+        printf 'No changes. The agentsmd service is installed and loaded.\n'
+        return
+    fi
+
+    if [[ ! -e "$plist_dir" ]]; then
+        mkdir -p "$plist_dir"
+        chmod 700 "$plist_dir"
+    fi
+
+    if [[ "$was_loaded" -eq 1 ]]; then
+        launchctl bootout "$(service_target)" || \
+            die "launchctl could not unload the existing service"
+    fi
+    launchctl enable "$(service_target)" >/dev/null 2>&1 || true
+
+    plist_temp="$(mktemp "$plist_dir/.agentsmd.plist.XXXXXX")"
+    TEMP_PATHS+=("$plist_temp")
+    cp "$proposed_plist" "$plist_temp"
+    chmod 600 "$plist_temp"
+    mv -f "$plist_temp" "$SERVICE_PLIST"
+
+    if ! launchctl bootstrap "$(service_domain)" "$SERVICE_PLIST"; then
+        die "launchctl could not load $(display_path "$SERVICE_PLIST")"
+    fi
+
+    printf 'Installed and started the agentsmd service.\n'
+    printf 'LaunchAgent: %s\n' "$(display_path "$SERVICE_PLIST")"
+}
+
+command_service_status() {
+    local workspace
+    local expected_plist
+    local configuration_state="unknown"
+    local loaded=0
+    local launchctl_output=""
+    local pid=""
+    local last_exit_status=""
+    local plist_mode=""
+    local plist_owner=""
+    local current_uid
+    local last_history_line=""
+    local last_history_status=""
+
+    current_uid="$(id -u)"
+
+    if [[ -f "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]]; then
+        if command -v plutil >/dev/null 2>&1 && plutil -lint "$SERVICE_PLIST" >/dev/null 2>&1; then
+            workspace="$(new_temp_dir)"
+            TEMP_PATHS+=("$workspace")
+            expected_plist="$workspace/$SERVICE_LABEL.plist"
+            write_service_plist "$expected_plist"
+            if cmp -s "$SERVICE_PLIST" "$expected_plist"; then
+                plist_mode="$(file_mode "$SERVICE_PLIST" || true)"
+                plist_owner="$(file_owner "$SERVICE_PLIST" || true)"
+                if [[ "$plist_mode" == "600" && "$plist_owner" == "$current_uid" ]]; then
+                    configuration_state="current"
+                else
+                    configuration_state="unsafe"
+                fi
+            else
+                configuration_state="stale"
+            fi
+        else
+            configuration_state="invalid"
+        fi
+    elif [[ -L "$SERVICE_PLIST" ]]; then
+        configuration_state="symlink"
+    elif [[ -e "$SERVICE_PLIST" ]]; then
+        configuration_state="invalid"
+    else
+        configuration_state="missing"
+    fi
+
+    if command -v launchctl >/dev/null 2>&1 && service_is_loaded; then
+        loaded=1
+        launchctl_output="$(launchctl print "$(service_target)" 2>/dev/null || true)"
+        pid="$(printf '%s\n' "$launchctl_output" | awk -F'= ' '/^[[:space:]]*pid = / { print $2; exit }')"
+        last_exit_status="$(printf '%s\n' "$launchctl_output" | awk -F'= ' '/^[[:space:]]*last exit code = / { print $2; exit }')"
+    fi
+
+    printf 'agentsmd service\n'
+    printf 'Platform:     macOS\n'
+    printf 'LaunchAgent:  %s (%s)\n' "$(display_path "$SERVICE_PLIST")" "$configuration_state"
+    if [[ "$loaded" -eq 1 ]]; then
+        printf 'Loaded:       yes\n'
+    else
+        printf 'Loaded:       no\n'
+    fi
+    if [[ -n "$pid" ]]; then
+        printf 'Running PID:  %s\n' "$pid"
+    fi
+    if [[ -n "$last_exit_status" ]]; then
+        printf 'Last exit:    %s\n' "$last_exit_status"
+    fi
+    if [[ -f "$SERVICE_HISTORY_FILE" && ! -L "$SERVICE_HISTORY_FILE" ]]; then
+        if [[ -s "$SERVICE_HISTORY_FILE" ]]; then
+            printf 'Last build:   '
+            tail -n 1 "$SERVICE_HISTORY_FILE" | awk -F '\t' \
+                '{ printf "%s %s %s - %s\n", $1, $2, $3, $4 }'
+            last_history_line="$(tail -n 1 "$SERVICE_HISTORY_FILE")"
+            last_history_status="$(printf '%s\n' "$last_history_line" | awk -F '\t' '{ print $2 }')"
+        else
+            printf 'Last build:   none\n'
+        fi
+    fi
+    printf 'History:      %s\n' "$(display_path "$SERVICE_HISTORY_FILE")"
+    printf 'Output log:   %s\n' "$(display_path "$SERVICE_OUTPUT_LOG")"
+    printf 'Error log:    %s\n' "$(display_path "$SERVICE_ERROR_LOG")"
+
+    case "$configuration_state:$loaded" in
+        current:1)
+            if [[ -n "$last_history_status" && "$last_history_status" != "ok" ]]; then
+                printf '\nThe last unattended build failed. Run "%s service doctor" for details.\n' \
+                    "$PROGRAM_NAME"
+            fi
+            ;;
+        missing:0)
+            printf '\nThe service is not installed. Run: %s service install\n' "$PROGRAM_NAME"
+            ;;
+        *)
+            printf '\nRun "%s service doctor" for details.\n' "$PROGRAM_NAME"
+            ;;
+    esac
+}
+
+command_service_history() {
+    local count="${1:-20}"
+    local history_lines
+
+    case "$count" in
+        ''|*[!0-9]*) die "history count must be a positive integer" ;;
+        0) die "history count must be greater than zero" ;;
+    esac
+
+    if [[ ! -e "$SERVICE_HISTORY_FILE" && ! -L "$SERVICE_HISTORY_FILE" ]] || \
+       [[ -f "$SERVICE_HISTORY_FILE" && ! -s "$SERVICE_HISTORY_FILE" ]]; then
+        printf 'No service build history yet.\n'
+        return
+    fi
+    if [[ ! -f "$SERVICE_HISTORY_FILE" || -L "$SERVICE_HISTORY_FILE" ]]; then
+        die "service history is not a regular file: $(display_path "$SERVICE_HISTORY_FILE")"
+    fi
+
+    printf 'Time (UTC)            Status  Action       Details\n'
+    printf '%s\n' '--------------------  ------  -----------  -------'
+    history_lines="$(tail -n "$count" "$SERVICE_HISTORY_FILE")"
+    printf '%s\n' "$history_lines" | awk -F '\t' \
+        '{ printf "%-20s  %-6s  %-11s  %s\n", $1, $2, $3, $4 }'
+}
+
+doctor_check() {
+    local status="$1"
+    local description="$2"
+
+    printf '%s %s\n' "$status" "$description"
+}
+
+command_service_doctor() {
+    local failed=0
+    local have_plutil=0
+    local workspace
+    local expected_plist
+    local configured_program=""
+    local configured_shared=""
+    local configured_local=""
+    local configured_output=""
+    local expected_program
+    local output_mode=""
+    local output_owner=""
+    local plist_mode=""
+    local plist_owner=""
+    local history_mode=""
+    local history_owner=""
+    local log_file
+    local log_mode=""
+    local log_owner=""
+    local current_uid
+    local last_history_line=""
+    local last_history_timestamp=""
+    local last_history_status=""
+    local last_history_action=""
+    local last_history_details=""
+    local service_installed=0
+
+    current_uid="$(id -u)"
+
+    if command -v launchctl >/dev/null 2>&1; then
+        doctor_check "✅" "launchctl is available"
+    else
+        doctor_check "❌" "launchctl is missing"
+        failed=1
+    fi
+
+    if command -v plutil >/dev/null 2>&1; then
+        doctor_check "✅" "plutil is available"
+        have_plutil=1
+    else
+        doctor_check "❌" "plutil is missing"
+        failed=1
+    fi
+
+    if [[ -f "$SHARED_FILE" && -r "$SHARED_FILE" ]]; then
+        doctor_check "✅" "shared source is readable: $(display_path "$SHARED_FILE")"
+    else
+        doctor_check "❌" "shared source is missing or unreadable: $(display_path "$SHARED_FILE")"
+        failed=1
+    fi
+    if [[ -f "$LOCAL_FILE" && -r "$LOCAL_FILE" ]]; then
+        doctor_check "✅" "local source is readable: $(display_path "$LOCAL_FILE")"
+    else
+        doctor_check "❌" "local source is missing or unreadable: $(display_path "$LOCAL_FILE")"
+        failed=1
+    fi
+
+    if [[ ! -e "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]]; then
+        doctor_check "❌" "LaunchAgent is not installed: $(display_path "$SERVICE_PLIST")"
+        failed=1
+    elif [[ ! -f "$SERVICE_PLIST" || -L "$SERVICE_PLIST" ]]; then
+        doctor_check "❌" "LaunchAgent is not a regular file: $(display_path "$SERVICE_PLIST")"
+        failed=1
+    elif [[ "$have_plutil" -eq 0 ]]; then
+        doctor_check "❌" "LaunchAgent plist could not be checked without plutil"
+        failed=1
+    elif ! plutil -lint "$SERVICE_PLIST" >/dev/null 2>&1; then
+        doctor_check "❌" "LaunchAgent plist is invalid: $(display_path "$SERVICE_PLIST")"
+        failed=1
+    else
+        service_installed=1
+        doctor_check "✅" "LaunchAgent plist is valid"
+        plist_mode="$(file_mode "$SERVICE_PLIST" || true)"
+        plist_owner="$(file_owner "$SERVICE_PLIST" || true)"
+        if [[ "$plist_mode" == "600" && "$plist_owner" == "$current_uid" ]]; then
+            doctor_check "✅" "LaunchAgent is owned by the current user with mode 0600"
+        else
+            doctor_check "❌" "LaunchAgent must be owned by the current user with mode 0600"
+            failed=1
+        fi
+
+        workspace="$(new_temp_dir)"
+        TEMP_PATHS+=("$workspace")
+        expected_plist="$workspace/$SERVICE_LABEL.plist"
+        write_service_plist "$expected_plist"
+        if cmp -s "$SERVICE_PLIST" "$expected_plist"; then
+            doctor_check "✅" "LaunchAgent configuration matches the current command"
+        else
+            doctor_check "❌" "LaunchAgent configuration is stale; reinstall the service"
+            failed=1
+        fi
+
+        configured_program="$(plutil -extract ProgramArguments.1 raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
+        configured_shared="$(plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
+        configured_local="$(plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
+        configured_output="$(plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
+        expected_program="$(service_program_path)"
+
+        if [[ "$configured_program" == "$expected_program" && -x "$configured_program" ]]; then
+            doctor_check "✅" "configured command is executable: $(display_path "$configured_program")"
+        else
+            doctor_check "❌" "configured command is missing or changed: $(display_path "$configured_program")"
+            failed=1
+        fi
+        if [[ "$configured_shared" != "$SHARED_FILE" || \
+              "$configured_local" != "$LOCAL_FILE" || \
+              "$configured_output" != "$OUTPUT_FILE" ]]; then
+            doctor_check "❌" "configured paths do not match the current environment"
+            failed=1
+        fi
+    fi
+
+    if command -v launchctl >/dev/null 2>&1 && service_is_loaded; then
+        doctor_check "✅" "LaunchAgent is loaded"
+    else
+        doctor_check "❌" "LaunchAgent is not loaded"
+        failed=1
+    fi
+
+    if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+        output_mode="$(file_mode "$OUTPUT_FILE" || true)"
+    fi
+    if [[ -e "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
+        output_owner="$(file_owner "$OUTPUT_FILE" || true)"
+    fi
+    if [[ -f "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" && \
+          "$output_mode" == "600" && "$output_owner" == "$current_uid" ]]; then
+        doctor_check "✅" "generated file is a private regular file: $(display_path "$OUTPUT_FILE")"
+    else
+        doctor_check "❌" "generated file is missing, unsafe, not owned by the current user, or not mode 0600: $(display_path "$OUTPUT_FILE")"
+        failed=1
+    fi
+
+    if [[ -f "$SERVICE_HISTORY_FILE" && ! -L "$SERVICE_HISTORY_FILE" ]]; then
+        history_mode="$(file_mode "$SERVICE_HISTORY_FILE" || true)"
+        history_owner="$(file_owner "$SERVICE_HISTORY_FILE" || true)"
+        if [[ "$history_mode" == "600" && "$history_owner" == "$current_uid" ]]; then
+            doctor_check "✅" "service history is private"
+        else
+            doctor_check "❌" "service history must be owned by the current user with mode 0600"
+            failed=1
+        fi
+
+        if [[ -s "$SERVICE_HISTORY_FILE" ]]; then
+            last_history_line="$(tail -n 1 "$SERVICE_HISTORY_FILE")"
+            IFS=$'\t' read -r \
+                last_history_timestamp last_history_status \
+                last_history_action last_history_details <<<"$last_history_line"
+            if [[ "$last_history_status" == "ok" ]]; then
+                doctor_check "✅" "last unattended build succeeded at $last_history_timestamp"
+            else
+                doctor_check "❌" "last unattended build failed at $last_history_timestamp: $last_history_details"
+                failed=1
+            fi
+        fi
+    elif [[ -e "$SERVICE_HISTORY_FILE" || -L "$SERVICE_HISTORY_FILE" ]]; then
+        doctor_check "❌" "service history path is unsafe: $(display_path "$SERVICE_HISTORY_FILE")"
+        failed=1
+    else
+        doctor_check "ℹ️" "service history has not been created yet"
+    fi
+
+    for log_file in "$SERVICE_OUTPUT_LOG" "$SERVICE_ERROR_LOG"; do
+        if [[ -f "$log_file" && ! -L "$log_file" ]]; then
+            log_mode="$(file_mode "$log_file" || true)"
+            log_owner="$(file_owner "$log_file" || true)"
+            if [[ "$log_mode" == "600" && "$log_owner" == "$current_uid" ]]; then
+                doctor_check "✅" "service log is private: $(display_path "$log_file")"
+            else
+                doctor_check "❌" "service log must be owned by the current user with mode 0600: $(display_path "$log_file")"
+                failed=1
+            fi
+        elif [[ "$service_installed" -eq 1 ]]; then
+            doctor_check "❌" "service log is missing or unsafe: $(display_path "$log_file")"
+            failed=1
+        else
+            doctor_check "ℹ️" "service log has not been created yet: $(display_path "$log_file")"
+        fi
+    done
+
+    if [[ "$failed" -eq 0 ]]; then
+        printf '\nNo problems found.\n'
+    else
+        printf '\nProblems found. Run "%s service install" after fixing source or path errors.\n' "$PROGRAM_NAME"
+        return 1
+    fi
+}
+
+command_service_start() {
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
+    [[ -f "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]] || \
+        die "service is not installed; run: $PROGRAM_NAME service install"
+
+    ensure_private_directory "$SERVICE_LOG_HOME" "service log path"
+    ensure_private_directory "$SERVICE_STATE_HOME" "service state path"
+    ensure_private_file "$SERVICE_OUTPUT_LOG" "service output log"
+    ensure_private_file "$SERVICE_ERROR_LOG" "service error log"
+
+    if service_is_loaded; then
+        launchctl kickstart "$(service_target)" || \
+            die "launchctl could not trigger the service"
+        printf 'Triggered an agentsmd service build.\n'
+    else
+        launchctl enable "$(service_target)" >/dev/null 2>&1 || true
+        launchctl bootstrap "$(service_domain)" "$SERVICE_PLIST" || \
+            die "launchctl could not start the service"
+        printf 'Started the agentsmd service.\n'
+    fi
+}
+
+command_service_stop() {
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
+
+    if service_is_loaded; then
+        launchctl disable "$(service_target)" || \
+            die "launchctl could not disable the service"
+        if ! launchctl bootout "$(service_target)"; then
+            launchctl enable "$(service_target)" >/dev/null 2>&1 || true
+            die "launchctl could not stop the service"
+        fi
+        printf 'Stopped and disabled the agentsmd service.\n'
+    else
+        launchctl disable "$(service_target)" || \
+            die "launchctl could not disable the service"
+        printf 'The agentsmd service is stopped and disabled.\n'
+    fi
+}
+
+command_service_restart() {
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
+    [[ -f "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]] || \
+        die "service is not installed; run: $PROGRAM_NAME service install"
+
+    ensure_private_directory "$SERVICE_LOG_HOME" "service log path"
+    ensure_private_directory "$SERVICE_STATE_HOME" "service state path"
+    ensure_private_file "$SERVICE_OUTPUT_LOG" "service output log"
+    ensure_private_file "$SERVICE_ERROR_LOG" "service error log"
+
+    if service_is_loaded; then
+        launchctl kickstart -k "$(service_target)" || \
+            die "launchctl could not restart the service"
+        printf 'Restarted the agentsmd service.\n'
+    else
+        command_service_start
+    fi
+}
+
+command_service_uninstall() {
+    local changed=0
+
+    command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
+
+    if service_is_loaded; then
+        launchctl bootout "$(service_target)" || \
+            die "launchctl could not stop the service"
+        changed=1
+    fi
+
+    launchctl enable "$(service_target)" >/dev/null 2>&1 || true
+
+    if [[ -e "$SERVICE_PLIST" || -L "$SERVICE_PLIST" ]]; then
+        if [[ -d "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]]; then
+            die "refusing to remove directory: $(display_path "$SERVICE_PLIST")"
+        fi
+        rm "$SERVICE_PLIST"
+        changed=1
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+        printf 'Uninstalled the agentsmd service. History and logs were kept.\n'
+    else
+        printf 'No changes. The agentsmd service is not installed.\n'
+    fi
+}
+
+command_service() {
+    local subcommand="${1:-help}"
+    local extra_argument="${2:-}"
+
+    require_macos
+    validate_service_paths
+
+    case "$subcommand" in
+        install|status|doctor|start|stop|restart|run|uninstall|help|-h|--help)
+            if [[ "$#" -gt 1 ]]; then
+                die "unexpected argument: ${2:-}"
+            fi
+            ;;
+        history)
+            if [[ "$#" -gt 2 ]]; then
+                die "unexpected argument: $3"
+            fi
+            ;;
+        *)
+            printf 'error: unknown service command: %s\n\n' "$subcommand" >&2
+            service_usage >&2
+            exit 2
+            ;;
+    esac
+
+    case "$subcommand" in
+        install) command_service_install ;;
+        status) command_service_status ;;
+        history) command_service_history "$extra_argument" ;;
+        doctor) command_service_doctor ;;
+        start) command_service_start ;;
+        stop) command_service_stop ;;
+        restart) command_service_restart ;;
+        run) command_service_run ;;
+        uninstall) command_service_uninstall ;;
+        help|-h|--help) service_usage ;;
+    esac
+}
+
 main() {
     local command="${1:-help}"
 
     validate_paths
 
-    if [[ "$#" -gt 1 ]]; then
+    if [[ "$command" != "service" && "$#" -gt 1 ]]; then
         die "unexpected argument: $2"
     fi
 
@@ -574,6 +1592,10 @@ main() {
             ;;
         install)
             command_install
+            ;;
+        service)
+            shift
+            command_service "$@"
             ;;
         help|-h|--help)
             usage
