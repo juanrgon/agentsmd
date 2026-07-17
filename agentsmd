@@ -16,7 +16,13 @@ SERVICE_HISTORY_FILE="$SERVICE_STATE_HOME/history.tsv"
 SERVICE_LOG_HOME="${AGENTSMD_LOG_HOME:-$HOME/Library/Logs/agentsmd}"
 SERVICE_OUTPUT_LOG="$SERVICE_LOG_HOME/service.log"
 SERVICE_ERROR_LOG="$SERVICE_LOG_HOME/service.error.log"
-UPDATE_URL="${AGENTSMD_UPDATE_URL:-https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd}"
+if [[ -n "${AGENTSMD_UPDATE_URL:-}" ]]; then
+    UPDATE_URL="$AGENTSMD_UPDATE_URL"
+else
+    # GitHub caches raw branch URLs briefly. Use a unique URL so a just-pushed
+    # main branch is not mistaken for the latest version.
+    UPDATE_URL="https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=$(date +%s)-$$"
+fi
 SERVICE_RUN_ACTIVE=0
 SERVICE_RUN_COMPLETED=0
 SERVICE_RUN_FAILURE_MESSAGE="service build failed"

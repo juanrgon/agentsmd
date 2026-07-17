@@ -62,6 +62,10 @@ make_fake_curl() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${FAKE_CURL_LOG:-}" ]]; then
+    printf '%s\n' "$*" >>"$FAKE_CURL_LOG"
+fi
+
 destination=""
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -655,7 +659,73 @@ test_self_update_does_not_refresh_service_for_other_executable() {
     pass
 }
 
-printf '1..14\n'
+test_install_downloads_from_uncached_main_url() {
+    local base="$TEST_ROOT/install-latest"
+    local home
+    local bin="$base/bin"
+    local install_dir
+    local update_source="$base/updated-agentsmd"
+    local curl_log="$base/curl.log"
+    local output
+
+    CURRENT_TEST="install downloads the latest main branch instead of a cached copy"
+    home="$(new_home install-latest)"
+    install_dir="$home/.local/bin"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# install latest test version\n' >>"$update_source"
+    make_fake_curl "$bin"
+
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        HOME="$home" \
+        AGENTSMD_INSTALL_DIR="$install_dir" \
+        FAKE_UPDATE_SOURCE="$update_source" \
+        FAKE_CURL_LOG="$curl_log" \
+            /bin/bash "$ROOT_DIR/install.sh"
+    )"
+
+    assert_contains "$output" "Installed:"
+    cmp -s "$install_dir/agentsmd" "$update_source" || fail "installer did not use the downloaded command"
+    grep -F 'https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=' "$curl_log" >/dev/null || \
+        fail "installer did not bypass GitHub's raw branch cache"
+
+    pass
+}
+
+test_self_update_downloads_from_uncached_main_url() {
+    local base="$TEST_ROOT/self-update-latest"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local update_source="$base/updated-agentsmd"
+    local curl_log="$base/curl.log"
+    local output
+
+    CURRENT_TEST="self-update downloads the latest main branch instead of a cached copy"
+    home="$(new_home self-update-latest)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# self-update latest test version\n' >>"$update_source"
+    make_fake_curl "$bin"
+
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        HOME="$home" \
+        FAKE_UPDATE_SOURCE="$update_source" \
+        FAKE_CURL_LOG="$curl_log" \
+            "$executable" self-update
+    )"
+
+    assert_contains "$output" "Updated:"
+    grep -F 'https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=' "$curl_log" >/dev/null || \
+        fail "self-update did not bypass GitHub's raw branch cache"
+
+    pass
+}
+
+printf '1..16\n'
 test_unattended_build_and_history
 test_unattended_build_replaces_output_safely
 test_unattended_build_records_failure
@@ -670,3 +740,5 @@ test_self_update_rejects_unexpected_content
 test_self_update_rejects_symlinked_executable
 test_self_update_refreshes_loaded_service_with_saved_paths
 test_self_update_does_not_refresh_service_for_other_executable
+test_install_downloads_from_uncached_main_url
+test_self_update_downloads_from_uncached_main_url

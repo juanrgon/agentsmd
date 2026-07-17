@@ -2,7 +2,13 @@
 
 set -euo pipefail
 
-SOURCE_URL="${AGENTSMD_SOURCE_URL:-https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd}"
+if [[ -n "${AGENTSMD_SOURCE_URL:-}" ]]; then
+    SOURCE_URL="$AGENTSMD_SOURCE_URL"
+else
+    # GitHub caches raw branch URLs briefly. Use a unique URL so a just-pushed
+    # main branch is not mistaken for the latest version.
+    SOURCE_URL="https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=$(date +%s)-$$"
+fi
 INSTALL_DIR="${AGENTSMD_INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_FILE="$INSTALL_DIR/agentsmd"
 TEMP_FILE=""
