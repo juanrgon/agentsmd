@@ -54,6 +54,76 @@ run_service() {
         "$AGENTSMD" service "$@"
 }
 
+make_fake_curl() {
+    local bin="$1"
+
+    mkdir -p "$bin"
+    cat >"$bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+destination=""
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -o)
+            destination="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$destination" ]]
+cp "$FAKE_UPDATE_SOURCE" "$destination"
+EOF
+    chmod 755 "$bin/curl"
+}
+
+make_fake_launchctl() {
+    local bin="$1"
+
+    mkdir -p "$bin"
+    cat >"$bin/launchctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"$FAKE_LAUNCHCTL_LOG"
+case "${1:-}" in
+    print)
+        if [[ -f "$HOME/.fake-launchctl-loaded" ]]; then
+            printf '    last exit code = 0\n'
+            exit 0
+        fi
+        exit 113
+        ;;
+    bootstrap)
+        : >"$HOME/.fake-launchctl-loaded"
+        ;;
+    bootout)
+        if [[ -f "$HOME/.fake-launchctl-loaded" ]]; then
+            rm "$HOME/.fake-launchctl-loaded"
+        fi
+        ;;
+esac
+EOF
+    chmod 755 "$bin/launchctl"
+}
+
+run_self_update() {
+    local home="$1"
+    local executable="$2"
+    local bin="$3"
+    local update_source="$4"
+
+    PATH="$bin:/usr/bin:/bin" \
+    HOME="$home" \
+    AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+    FAKE_UPDATE_SOURCE="$update_source" \
+        "$executable" self-update
+}
+
 test_unattended_build_and_history() {
     local home
     local output
@@ -313,7 +383,279 @@ EOF
     pass
 }
 
-printf '1..7\n'
+test_self_update_replaces_executable_and_creates_backup() {
+    local base="$TEST_ROOT/self-update-success"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local original="$base/original-agentsmd"
+    local update_source="$base/updated-agentsmd"
+    local backup
+    local output
+
+    CURRENT_TEST="self-update replaces the executable and creates a timestamped backup"
+    home="$(new_home self-update-success)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    cp "$executable" "$original"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# self-update test version\n' >>"$update_source"
+    make_fake_curl "$bin"
+
+    output="$(run_self_update "$home" "$executable" "$bin" "$update_source")"
+    assert_contains "$output" "Backup:"
+    assert_contains "$output" "Updated:"
+    cmp -s "$executable" "$update_source" || fail "executable was not replaced"
+
+    backup="$(find "$bin" -maxdepth 1 -type f -name 'agentsmd.*.bak' -print -quit)"
+    [[ -n "$backup" ]] || fail "self-update did not create a backup"
+    cmp -s "$backup" "$original" || fail "backup does not match the old executable"
+    [[ "$(stat -f '%Lp' "$executable")" == "755" ]] || fail "updated executable mode is not 0755"
+
+    pass
+}
+
+test_self_update_is_noop_when_current() {
+    local base="$TEST_ROOT/self-update-current"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local output
+
+    CURRENT_TEST="self-update is a no-op when the downloaded command is unchanged"
+    home="$(new_home self-update-current)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    make_fake_curl "$bin"
+
+    output="$(run_self_update "$home" "$executable" "$bin" "$AGENTSMD")"
+    assert_contains "$output" "already up to date"
+    [[ -z "$(find "$bin" -maxdepth 1 -name 'agentsmd.*.bak' -print -quit)" ]] || \
+        fail "unchanged self-update created a backup"
+
+    pass
+}
+
+test_self_update_rejects_invalid_bash() {
+    local base="$TEST_ROOT/self-update-invalid"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local original="$base/original-agentsmd"
+    local update_source="$base/invalid-agentsmd"
+    local output
+    local status
+
+    CURRENT_TEST="self-update rejects invalid Bash without changing the executable"
+    home="$(new_home self-update-invalid)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    cp "$executable" "$original"
+    printf '#!/usr/bin/env bash\nPROGRAM_NAME="agentsmd"\nif\n' >"$update_source"
+    make_fake_curl "$bin"
+
+    set +e
+    output="$(run_self_update "$home" "$executable" "$bin" "$update_source" 2>&1)"
+    status=$?
+    set -e
+
+    [[ "$status" -ne 0 ]] || fail "invalid Bash update did not fail"
+    assert_contains "$output" "downloaded agentsmd script is not valid Bash"
+    cmp -s "$executable" "$original" || fail "invalid update changed the executable"
+    [[ -z "$(find "$bin" -maxdepth 1 -name 'agentsmd.*.bak' -print -quit)" ]] || \
+        fail "invalid update created a backup"
+
+    pass
+}
+
+test_self_update_rejects_unexpected_content() {
+    local base="$TEST_ROOT/self-update-unexpected"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local original="$base/original-agentsmd"
+    local update_source="$base/not-agentsmd"
+    local output
+    local status
+
+    CURRENT_TEST="self-update rejects a valid script that is not agentsmd"
+    home="$(new_home self-update-unexpected)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    cp "$executable" "$original"
+    printf '#!/usr/bin/env bash\nprintf "not agentsmd\\n"\n' >"$update_source"
+    make_fake_curl "$bin"
+
+    set +e
+    output="$(run_self_update "$home" "$executable" "$bin" "$update_source" 2>&1)"
+    status=$?
+    set -e
+
+    [[ "$status" -ne 0 ]] || fail "unexpected update content did not fail"
+    assert_contains "$output" "downloaded file does not look like agentsmd"
+    cmp -s "$executable" "$original" || fail "unexpected update changed the executable"
+
+    pass
+}
+
+test_self_update_rejects_symlinked_executable() {
+    local base="$TEST_ROOT/self-update-symlink"
+    local home
+    local bin="$base/bin"
+    local target_dir="$base/target"
+    local target="$target_dir/agentsmd"
+    local executable="$bin/agentsmd"
+    local original="$base/original-agentsmd"
+    local update_source="$base/updated-agentsmd"
+    local output
+    local status
+
+    CURRENT_TEST="self-update rejects a symlinked executable"
+    home="$(new_home self-update-symlink)"
+    mkdir -p "$bin" "$target_dir"
+    cp "$AGENTSMD" "$target"
+    chmod 755 "$target"
+    cp "$target" "$original"
+    ln -s "$target" "$executable"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# self-update symlink test version\n' >>"$update_source"
+    make_fake_curl "$bin"
+
+    set +e
+    output="$(run_self_update "$home" "$executable" "$bin" "$update_source" 2>&1)"
+    status=$?
+    set -e
+
+    [[ "$status" -ne 0 ]] || fail "symlinked executable update did not fail"
+    assert_contains "$output" "self-update requires agentsmd to be a regular file"
+    [[ -L "$executable" ]] || fail "self-update replaced the executable symlink"
+    cmp -s "$target" "$original" || fail "self-update changed the symlink target"
+
+    pass
+}
+
+test_self_update_refreshes_loaded_service_with_saved_paths() {
+    local base="$TEST_ROOT/self-update-service"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local update_source="$base/updated-agentsmd"
+    local launchctl_log="$base/launchctl.log"
+    local shared="$base/config/shared.md"
+    local local_file="$base/config/local.md"
+    local generated="$base/config/generated.md"
+    local state="$base/config/state"
+    local logs="$base/config/logs"
+    local cache="$base/config/cache"
+    local plist
+    local output
+    local print_count
+
+    CURRENT_TEST="self-update refreshes a loaded service using its saved paths"
+    home="$(new_home self-update-service)"
+    mkdir -p "$bin" "$(dirname "$shared")"
+    printf 'custom shared instructions\n' >"$shared"
+    printf 'custom local instructions\n' >"$local_file"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# self-update service test version\n' >>"$update_source"
+    make_fake_curl "$bin"
+    make_fake_launchctl "$bin"
+
+    PATH="$bin:/usr/bin:/bin" \
+    FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+    HOME="$home" \
+    AGENTSMD_SHARED_FILE="$shared" \
+    AGENTSMD_LOCAL_FILE="$local_file" \
+    AGENTSMD_OUTPUT_FILE="$generated" \
+    AGENTSMD_STATE_HOME="$state" \
+    AGENTSMD_LOG_HOME="$logs" \
+    XDG_CACHE_HOME="$cache" \
+        "$executable" service install >/dev/null
+
+    plist="$home/Library/LaunchAgents/com.juanrgon.agentsmd.plist"
+    : >"$launchctl_log"
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+        AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+        FAKE_UPDATE_SOURCE="$update_source" \
+            "$executable" self-update
+    )"
+
+    assert_contains "$output" "No changes. The agentsmd service is installed and loaded."
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$plist")" == "$shared" ]] || \
+        fail "service refresh did not preserve the shared source path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$plist")" == "$local_file" ]] || \
+        fail "service refresh did not preserve the local source path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$plist")" == "$generated" ]] || \
+        fail "service refresh did not preserve the output path"
+    print_count="$(grep -c '^print ' "$launchctl_log" || true)"
+    [[ "$print_count" == "2" ]] || fail "loaded service was not checked and refreshed exactly once"
+
+    pass
+}
+
+test_self_update_does_not_refresh_service_for_other_executable() {
+    local base="$TEST_ROOT/self-update-other-service"
+    local home
+    local tools_bin="$base/tools"
+    local update_bin="$base/update-bin"
+    local service_bin="$base/service-bin"
+    local executable="$update_bin/agentsmd"
+    local service_executable="$service_bin/agentsmd"
+    local update_source="$base/updated-agentsmd"
+    local launchctl_log="$base/launchctl.log"
+    local output
+    local print_count
+
+    CURRENT_TEST="self-update leaves a service for another executable unchanged"
+    home="$(new_home self-update-other-service)"
+    mkdir -p "$update_bin" "$service_bin"
+    cp "$AGENTSMD" "$executable"
+    cp "$AGENTSMD" "$service_executable"
+    chmod 755 "$executable" "$service_executable"
+    cp "$AGENTSMD" "$update_source"
+    printf '\n# self-update other service test version\n' >>"$update_source"
+    make_fake_curl "$tools_bin"
+    make_fake_launchctl "$tools_bin"
+
+    PATH="$tools_bin:/usr/bin:/bin" \
+    FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+    HOME="$home" \
+    AGENTSMD_STATE_HOME="$home/state" \
+    AGENTSMD_LOG_HOME="$home/logs" \
+        "$service_executable" service install >/dev/null
+
+    : >"$launchctl_log"
+    output="$(
+        PATH="$tools_bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+        AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+        FAKE_UPDATE_SOURCE="$update_source" \
+            "$executable" self-update
+    )"
+
+    assert_contains "$output" "Updated:"
+    case "$output" in
+        *"The agentsmd service is installed and loaded"*)
+            fail "self-update refreshed a service that uses another executable"
+            ;;
+    esac
+    print_count="$(grep -c '^print ' "$launchctl_log" || true)"
+    [[ "$print_count" == "1" ]] || fail "service for another executable was refreshed"
+
+    pass
+}
+
+printf '1..14\n'
 test_unattended_build_and_history
 test_unattended_build_replaces_output_safely
 test_unattended_build_records_failure
@@ -321,3 +663,10 @@ test_service_install_and_uninstall
 test_service_status_and_doctor
 test_stale_lock_is_recovered
 test_non_macos_is_rejected
+test_self_update_replaces_executable_and_creates_backup
+test_self_update_is_noop_when_current
+test_self_update_rejects_invalid_bash
+test_self_update_rejects_unexpected_content
+test_self_update_rejects_symlinked_executable
+test_self_update_refreshes_loaded_service_with_saved_paths
+test_self_update_does_not_refresh_service_for_other_executable

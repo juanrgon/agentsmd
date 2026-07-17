@@ -18,6 +18,7 @@ with a UTC timestamp before it is replaced.
 agentsmd status
 agentsmd build
 agentsmd install
+agentsmd self-update
 agentsmd service install
 ```
 
@@ -26,6 +27,7 @@ agentsmd service install
 - `build` previews the generated diff and requires approval before changing
   `~/AGENTS.md`.
 - `install` previews and creates the harness symlinks after approval.
+- `self-update` downloads and installs the latest `agentsmd` command.
 - `service install` installs a per-user macOS LaunchAgent. It rebuilds the
   generated file at login and whenever either source file changes.
 
@@ -33,6 +35,24 @@ The default source files are:
 
 - `~/AGENTS.shared.md` for instructions shared across computers
 - `~/AGENTS.local.md` for machine-specific or sensitive instructions
+
+## Update agentsmd
+
+```bash
+agentsmd self-update
+```
+
+`self-update` downloads the command from the `main` branch, checks that it is
+valid Bash and looks like `agentsmd`, then replaces the invoked executable
+atomically. If the downloaded file is unchanged, it does nothing.
+
+Before replacing the command, it creates a backup beside the executable named
+`agentsmd.<UTC timestamp>.bak`. The executable must be a writable regular file,
+not a symlink. Set `AGENTSMD_UPDATE_URL` to use a different download URL.
+
+If a loaded agentsmd LaunchAgent uses the same executable, `self-update` also
+applies any service template changes while preserving the paths saved in its
+plist.
 
 ## Automatic builds on macOS
 
@@ -76,5 +96,5 @@ the history and logs so they remain available for troubleshooting.
 The LaunchAgent plist, history, and log files use owner-only permissions. Keep
 in mind that build errors can still include configured file paths.
 
-If the `agentsmd` executable or any configured source or output path changes,
-run `agentsmd service install` again to update the LaunchAgent.
+If you manually move the `agentsmd` executable or change a configured source or
+output path, run `agentsmd service install` again to update the LaunchAgent.

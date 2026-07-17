@@ -16,6 +16,7 @@ SERVICE_HISTORY_FILE="$SERVICE_STATE_HOME/history.tsv"
 SERVICE_LOG_HOME="${AGENTSMD_LOG_HOME:-$HOME/Library/Logs/agentsmd}"
 SERVICE_OUTPUT_LOG="$SERVICE_LOG_HOME/service.log"
 SERVICE_ERROR_LOG="$SERVICE_LOG_HOME/service.error.log"
+UPDATE_URL="${AGENTSMD_UPDATE_URL:-https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd}"
 SERVICE_RUN_ACTIVE=0
 SERVICE_RUN_COMPLETED=0
 SERVICE_RUN_FAILURE_MESSAGE="service build failed"
@@ -63,11 +64,12 @@ Usage:
   $PROGRAM_NAME <command>
 
 Commands:
-  status   Show the source files, generated file freshness, and harness links
-  build    Show the proposed AGENTS.md diff and apply it after approval
-  install  Create or repair the Copilot, Claude Code, Codex, and Pi links
-  service  Manage automatic background builds on macOS
-  help     Show this help text
+  status       Show source files, generated file freshness, and harness links
+  build        Show the proposed AGENTS.md diff and apply it after approval
+  install      Create or repair the supported harness links
+  self-update  Update the agentsmd command itself
+  service      Manage automatic background builds on macOS
+  help         Show this help text
 
 Files:
   Shared source:  $(display_path "$SHARED_FILE")
@@ -94,6 +96,10 @@ The install command points each supported harness directly at the generated
 file. It backs up every file or link that it replaces and also requires you to
 enter "yes".
 
+The self-update command downloads the latest agentsmd command, validates it,
+backs up the current executable, and replaces it atomically. If the macOS
+service is loaded from the same executable, self-update refreshes it too.
+
 The service command manages a macOS LaunchAgent that rebuilds the generated
 file at login and whenever either source file changes. Run
 "$PROGRAM_NAME service help" to see its commands. Services are not supported
@@ -105,9 +111,10 @@ Optional environment variables:
   AGENTSMD_OUTPUT_FILE  Override the generated file path
   AGENTSMD_STATE_HOME   Override the service history directory
   AGENTSMD_LOG_HOME     Override the service log directory
+  AGENTSMD_UPDATE_URL   Override the self-update download URL
   XDG_CACHE_HOME        Override the default backup directory
 
-None of these commands pull, push, commit, or make network requests.
+Only self-update makes a network request. No command pulls, pushes, or commits.
 EOF
 }
 
@@ -421,6 +428,36 @@ service_program_path() {
     [[ -n "$program_path" ]] || die "could not find the agentsmd executable"
     program_dir="$(cd -P "$(dirname "$program_path")" && pwd)"
     printf '%s/%s' "$program_dir" "$(basename "$program_path")"
+}
+
+download_file() {
+    local url="$1"
+    local destination="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$destination"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$destination" "$url"
+    else
+        die "curl or wget is required"
+    fi
+}
+
+next_command_backup_path() {
+    local command_path="$1"
+    local timestamp
+    local backup_path
+    local collision=2
+
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_path="$command_path.$timestamp.bak"
+
+    while [[ -e "$backup_path" || -L "$backup_path" ]]; do
+        backup_path="$command_path.$timestamp-$collision.bak"
+        collision=$((collision + 1))
+    done
+
+    printf '%s' "$backup_path"
 }
 
 xml_escape() {
@@ -1043,8 +1080,116 @@ command_install() {
     printf 'Installed harness links.\n'
 }
 
+command_self_update() {
+    local command_path
+    local command_dir
+    local update_temp
+    local backup_path
+
+    command_path="$(service_program_path)"
+    command_dir="$(dirname "$command_path")"
+
+    if [[ ! -f "$command_path" || -L "$command_path" ]]; then
+        die "self-update requires agentsmd to be a regular file: $(display_path "$command_path")"
+    fi
+    if [[ ! -w "$command_path" || ! -w "$command_dir" ]]; then
+        die "agentsmd is not writable: $(display_path "$command_path")"
+    fi
+
+    update_temp="$(mktemp "$command_dir/.agentsmd-update.XXXXXX")"
+    TEMP_PATHS+=("$update_temp")
+    download_file "$UPDATE_URL" "$update_temp"
+
+    if ! /bin/bash -n "$update_temp"; then
+        die "downloaded agentsmd script is not valid Bash"
+    fi
+    if ! grep -F 'PROGRAM_NAME="agentsmd"' "$update_temp" >/dev/null 2>&1; then
+        die "downloaded file does not look like agentsmd"
+    fi
+
+    chmod 755 "$update_temp"
+    if cmp -s "$command_path" "$update_temp"; then
+        printf 'No changes. %s is already up to date.\n' "$(display_path "$command_path")"
+        return
+    fi
+
+    backup_path="$(next_command_backup_path "$command_path")"
+    cp -p "$command_path" "$backup_path"
+    chmod 755 "$backup_path"
+    mv -f "$update_temp" "$command_path"
+
+    printf 'Backup: %s\n' "$(display_path "$backup_path")"
+    printf 'Updated: %s\n' "$(display_path "$command_path")"
+
+    if ! refresh_service_after_update "$command_path"; then
+        printf 'warning: agentsmd updated, but the service could not be refreshed\n' >&2
+        printf 'run: %s service install\n' "$(display_path "$command_path")" >&2
+        return 1
+    fi
+}
+
 service_is_loaded() {
     launchctl print "$(service_target)" >/dev/null 2>&1
+}
+
+refresh_service_after_update() {
+    local command_path="$1"
+    local configured_program=""
+    local service_home=""
+    local service_shared=""
+    local service_local=""
+    local service_output=""
+    local service_state=""
+    local service_logs=""
+    local service_cache=""
+
+    [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 0
+    [[ -f "$SERVICE_PLIST" && ! -L "$SERVICE_PLIST" ]] || return 0
+    command -v launchctl >/dev/null 2>&1 || return 0
+    command -v plutil >/dev/null 2>&1 || return 0
+    service_is_loaded || return 0
+
+    configured_program="$(
+        plutil -extract ProgramArguments.1 raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    [[ "$configured_program" == "$command_path" ]] || return 0
+
+    service_home="$(
+        plutil -extract EnvironmentVariables.HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_shared="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_local="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_output="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_state="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_STATE_HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_logs="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_LOG_HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    service_cache="$(
+        plutil -extract EnvironmentVariables.XDG_CACHE_HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+
+    if [[ -z "$service_home" || -z "$service_shared" || -z "$service_local" || \
+          -z "$service_output" || -z "$service_state" || -z "$service_logs" || \
+          -z "$service_cache" ]]; then
+        return 1
+    fi
+
+    HOME="$service_home" \
+    AGENTSMD_SHARED_FILE="$service_shared" \
+    AGENTSMD_LOCAL_FILE="$service_local" \
+    AGENTSMD_OUTPUT_FILE="$service_output" \
+    AGENTSMD_STATE_HOME="$service_state" \
+    AGENTSMD_LOG_HOME="$service_logs" \
+    XDG_CACHE_HOME="$service_cache" \
+        "$command_path" service install
 }
 
 command_service_install() {
@@ -1592,6 +1737,9 @@ main() {
             ;;
         install)
             command_install
+            ;;
+        self-update)
+            command_self_update
             ;;
         service)
             shift
