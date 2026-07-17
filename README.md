@@ -23,8 +23,8 @@ agentsmd self-update
 agentsmd service install
 ```
 
-- `status` shows the source files, whether `~/AGENTS.md` is current, and the
-  harness symlinks.
+- `status` shows the source files, whether `~/AGENTS.md` is current, the
+  harness symlinks, and whether the background service is running.
 - `build` previews the generated diff and requires approval before changing
   `~/AGENTS.md`.
 - `install` previews and creates the harness symlinks after approval.

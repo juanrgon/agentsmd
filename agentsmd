@@ -70,7 +70,7 @@ Usage:
   $PROGRAM_NAME <command>
 
 Commands:
-  status       Show source files, generated file freshness, and harness links
+  status       Show generated file, harness links, and service state
   build        Show the proposed AGENTS.md diff and apply it after approval
   install      Create or repair the supported harness links
   self-update  Update the agentsmd command itself
@@ -976,6 +976,17 @@ command_status() {
                 "${link_names[$link_index]}" "$(display_path "$link_path")" "$(display_path "$OUTPUT_FILE")"
         fi
     done
+
+    printf '\n'
+    if [[ "$(uname -s 2>/dev/null || true)" != "Darwin" ]]; then
+        printf 'ℹ️  Service: unavailable (macOS only)\n'
+    elif command -v launchctl >/dev/null 2>&1 && service_is_loaded; then
+        printf '✅ Service: installed and running\n'
+    elif [[ -e "$SERVICE_PLIST" || -L "$SERVICE_PLIST" ]]; then
+        printf '⏸️  Service: installed but stopped\n'
+    else
+        printf 'ℹ️  Service: not installed\n'
+    fi
 }
 
 backup_item() {

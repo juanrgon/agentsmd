@@ -725,7 +725,50 @@ test_self_update_downloads_from_uncached_main_url() {
     pass
 }
 
-printf '1..16\n'
+test_status_summarizes_service_state() {
+    local base="$TEST_ROOT/status-service-summary"
+    local home
+    local bin="$base/bin"
+    local launchctl_log="$base/launchctl.log"
+    local plist
+    local output
+
+    CURRENT_TEST="status summarizes whether the service is installed and running"
+    home="$(new_home status-service-summary)"
+    make_fake_launchctl "$bin"
+    plist="$home/Library/LaunchAgents/com.juanrgon.agentsmd.plist"
+
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+            "$AGENTSMD" status
+    )"
+    assert_contains "$output" "Service: not installed"
+
+    mkdir -p "$(dirname "$plist")"
+    : >"$plist"
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+            "$AGENTSMD" status
+    )"
+    assert_contains "$output" "Service: installed but stopped"
+
+    : >"$home/.fake-launchctl-loaded"
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+            "$AGENTSMD" status
+    )"
+    assert_contains "$output" "Service: installed and running"
+
+    pass
+}
+
+printf '1..17\n'
 test_unattended_build_and_history
 test_unattended_build_replaces_output_safely
 test_unattended_build_records_failure
@@ -742,3 +785,4 @@ test_self_update_refreshes_loaded_service_with_saved_paths
 test_self_update_does_not_refresh_service_for_other_executable
 test_install_downloads_from_uncached_main_url
 test_self_update_downloads_from_uncached_main_url
+test_status_summarizes_service_state
