@@ -5,9 +5,9 @@ set -euo pipefail
 if [[ -n "${AGENTSMD_SOURCE_URL:-}" ]]; then
     SOURCE_URL="$AGENTSMD_SOURCE_URL"
 else
-    # GitHub caches raw branch URLs briefly. Use a unique URL so a just-pushed
-    # main branch is not mistaken for the latest version.
-    SOURCE_URL="https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=$(date +%s)-$$"
+    # The raw branch URL can lag behind a just-pushed branch. GitHub's contents
+    # API resolves the branch first and returns the current file directly.
+    SOURCE_URL="https://api.github.com/repos/juanrgon/agentsmd/contents/agentsmd?ref=main&cache=$(date +%s)-$$"
 fi
 INSTALL_DIR="${AGENTSMD_INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_FILE="$INSTALL_DIR/agentsmd"
@@ -59,9 +59,23 @@ download() {
     local destination="$2"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$destination"
+        case "$url" in
+            https://api.github.com/*)
+                curl -fsSL -H 'Accept: application/vnd.github.raw' "$url" -o "$destination"
+                ;;
+            *)
+                curl -fsSL "$url" -o "$destination"
+                ;;
+        esac
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$destination" "$url"
+        case "$url" in
+            https://api.github.com/*)
+                wget -qO "$destination" --header='Accept: application/vnd.github.raw' "$url"
+                ;;
+            *)
+                wget -qO "$destination" "$url"
+                ;;
+        esac
     else
         printf 'error: curl or wget is required\n' >&2
         exit 1

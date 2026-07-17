@@ -19,9 +19,9 @@ SERVICE_ERROR_LOG="$SERVICE_LOG_HOME/service.error.log"
 if [[ -n "${AGENTSMD_UPDATE_URL:-}" ]]; then
     UPDATE_URL="$AGENTSMD_UPDATE_URL"
 else
-    # GitHub caches raw branch URLs briefly. Use a unique URL so a just-pushed
-    # main branch is not mistaken for the latest version.
-    UPDATE_URL="https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=$(date +%s)-$$"
+    # The raw branch URL can lag behind a just-pushed branch. GitHub's contents
+    # API resolves the branch first and returns the current file directly.
+    UPDATE_URL="https://api.github.com/repos/juanrgon/agentsmd/contents/agentsmd?ref=main&cache=$(date +%s)-$$"
 fi
 SERVICE_RUN_ACTIVE=0
 SERVICE_RUN_COMPLETED=0
@@ -441,9 +441,23 @@ download_file() {
     local destination="$2"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$destination"
+        case "$url" in
+            https://api.github.com/*)
+                curl -fsSL -H 'Accept: application/vnd.github.raw' "$url" -o "$destination"
+                ;;
+            *)
+                curl -fsSL "$url" -o "$destination"
+                ;;
+        esac
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$destination" "$url"
+        case "$url" in
+            https://api.github.com/*)
+                wget -qO "$destination" --header='Accept: application/vnd.github.raw' "$url"
+                ;;
+            *)
+                wget -qO "$destination" "$url"
+                ;;
+        esac
     else
         die "curl or wget is required"
     fi

@@ -686,8 +686,10 @@ test_install_downloads_from_uncached_main_url() {
 
     assert_contains "$output" "Installed:"
     cmp -s "$install_dir/agentsmd" "$update_source" || fail "installer did not use the downloaded command"
-    grep -F 'https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=' "$curl_log" >/dev/null || \
-        fail "installer did not bypass GitHub's raw branch cache"
+    grep -F 'Accept: application/vnd.github.raw' "$curl_log" >/dev/null || \
+        fail "installer did not request raw contents from GitHub's API"
+    grep -F 'https://api.github.com/repos/juanrgon/agentsmd/contents/agentsmd?ref=main&cache=' "$curl_log" >/dev/null || \
+        fail "installer did not download the current main branch through GitHub's API"
 
     pass
 }
@@ -719,8 +721,10 @@ test_self_update_downloads_from_uncached_main_url() {
     )"
 
     assert_contains "$output" "Updated:"
-    grep -F 'https://raw.githubusercontent.com/juanrgon/agentsmd/main/agentsmd?cache=' "$curl_log" >/dev/null || \
-        fail "self-update did not bypass GitHub's raw branch cache"
+    grep -F 'Accept: application/vnd.github.raw' "$curl_log" >/dev/null || \
+        fail "self-update did not request raw contents from GitHub's API"
+    grep -F 'https://api.github.com/repos/juanrgon/agentsmd/contents/agentsmd?ref=main&cache=' "$curl_log" >/dev/null || \
+        fail "self-update did not download the current main branch through GitHub's API"
 
     pass
 }

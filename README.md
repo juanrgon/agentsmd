@@ -6,12 +6,13 @@ connect it to GitHub Copilot CLI, Claude Code, Codex, and Pi.
 ## Install
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/juanrgon/agentsmd/main/install.sh?cache=$(date +%s)-$$" | bash
+curl -fsSL -H 'Accept: application/vnd.github.raw' \
+  "https://api.github.com/repos/juanrgon/agentsmd/contents/install.sh?ref=main&cache=$(date +%s)-$$" | bash
 ```
 
 This installs `agentsmd` to `~/.local/bin`. An existing command is backed up
-with a UTC timestamp before it is replaced. The unique query avoids GitHub's
-short raw-file cache, so a just-pushed version is downloaded.
+with a UTC timestamp before it is replaced. The installer uses GitHub's API so
+a just-pushed version is downloaded instead of an older raw branch response.
 
 ## Use
 
