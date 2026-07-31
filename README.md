@@ -101,7 +101,8 @@ agentsmd self-update
 
 `self-update` downloads the command from the `main` branch, checks that it is
 valid Bash and looks like `agentsmd`, then replaces the invoked executable
-atomically. If the downloaded file is unchanged, it does nothing.
+atomically. If the downloaded file is unchanged, the executable is left alone
+without a backup.
 
 Before replacing the command, it creates a backup beside the executable named
 `agentsmd.<UTC timestamp>.bak`. The executable must be a writable regular file,
@@ -109,7 +110,8 @@ not a symlink. Set `AGENTSMD_UPDATE_URL` to use a different download URL.
 
 If a loaded agentsmd LaunchAgent uses the same executable, `self-update` also
 applies any service template changes while preserving the paths saved in its
-plist.
+plist. This service refresh still runs when the executable is already current;
+a healthy service remains loaded without being reinstalled.
 
 ## Automatic builds on macOS
 

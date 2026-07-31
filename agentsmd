@@ -1641,6 +1641,11 @@ command_self_update() {
     chmod 755 "$update_temp"
     if cmp -s "$command_path" "$update_temp"; then
         printf 'No changes. %s is already up to date.\n' "$(display_path "$command_path")"
+        if ! refresh_service_after_update "$command_path"; then
+            printf 'warning: agentsmd is current, but the service could not be refreshed\n' >&2
+            printf 'run: %s service install\n' "$(display_path "$command_path")" >&2
+            return 1
+        fi
         return
     fi
 

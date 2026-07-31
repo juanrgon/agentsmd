@@ -555,6 +555,9 @@ case "${1:-}" in
         exit 113
         ;;
     bootstrap)
+        if [[ "${FAKE_LAUNCHCTL_FAIL_BOOTSTRAP:-0}" -eq 1 ]]; then
+            exit 1
+        fi
         : >"$HOME/.fake-launchctl-loaded"
         ;;
     bootout)
@@ -1189,6 +1192,149 @@ test_self_update_migrates_legacy_service_config_path() {
     pass
 }
 
+test_current_self_update_repairs_legacy_service() {
+    local base="$TEST_ROOT/self-update-current-legacy-service"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local launchctl_log="$base/launchctl.log"
+    local plist
+    local saved_shared
+    local saved_local
+    local saved_output
+    local saved_state
+    local saved_logs
+    local saved_cache
+    local output
+    local print_count
+
+    CURRENT_TEST="current self-update repairs a loaded legacy service"
+    home="$(new_commit_home self-update-current-legacy-service)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    make_fake_curl "$bin"
+    make_fake_launchctl "$bin"
+
+    PATH="$bin:/usr/bin:/bin" \
+    FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+    HOME="$home" \
+    AGENTSMD_STATE_HOME="$home/state" \
+    AGENTSMD_LOG_HOME="$home/logs" \
+    XDG_CACHE_HOME="$home/cache" \
+        "$executable" service install >/dev/null
+
+    plist="$(
+        find "$home/Library/LaunchAgents" -maxdepth 1 -type f \
+            -name '*.plist' -print -quit
+    )"
+    [[ -n "$plist" ]] || fail "service install did not create a LaunchAgent plist"
+    saved_shared="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$plist")"
+    saved_local="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$plist")"
+    saved_output="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$plist")"
+    saved_state="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_STATE_HOME raw -o - "$plist")"
+    saved_logs="$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_LOG_HOME raw -o - "$plist")"
+    saved_cache="$(/usr/bin/plutil -extract EnvironmentVariables.XDG_CACHE_HOME raw -o - "$plist")"
+    /usr/bin/plutil -remove EnvironmentVariables.AGENTSMD_CONFIG_FILE "$plist"
+
+    : >"$launchctl_log"
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+        AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+        FAKE_UPDATE_SOURCE="$AGENTSMD" \
+            "$executable" self-update
+    )"
+
+    assert_contains "$output" "already up to date"
+    assert_contains "$output" "Installed and started the agentsmd service."
+    [[ "$(
+        /usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_CONFIG_FILE raw \
+            -o - "$plist"
+    )" == "$home/agentsmd/config.toml" ]] || \
+        fail "current self-update did not derive the default config path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$plist")" == "$saved_shared" ]] || \
+        fail "current self-update changed the shared source path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$plist")" == "$saved_local" ]] || \
+        fail "current self-update changed the local source path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$plist")" == "$saved_output" ]] || \
+        fail "current self-update changed the output path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_STATE_HOME raw -o - "$plist")" == "$saved_state" ]] || \
+        fail "current self-update changed the state path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.AGENTSMD_LOG_HOME raw -o - "$plist")" == "$saved_logs" ]] || \
+        fail "current self-update changed the log path"
+    [[ "$(/usr/bin/plutil -extract EnvironmentVariables.XDG_CACHE_HOME raw -o - "$plist")" == "$saved_cache" ]] || \
+        fail "current self-update changed the cache path"
+    [[ -z "$(find "$bin" -maxdepth 1 -name 'agentsmd.*.bak' -print -quit)" ]] || \
+        fail "current self-update created an executable backup"
+    cmp -s "$executable" "$AGENTSMD" || \
+        fail "current self-update changed the executable"
+    print_count="$(grep -c '^print ' "$launchctl_log" || true)"
+    [[ "$print_count" == "2" ]] || \
+        fail "current self-update did not check and repair the loaded service exactly once"
+
+    pass
+}
+
+test_current_self_update_reports_service_refresh_failure() {
+    local base="$TEST_ROOT/self-update-current-service-failure"
+    local home
+    local bin="$base/bin"
+    local executable="$bin/agentsmd"
+    local launchctl_log="$base/launchctl.log"
+    local plist
+    local output
+    local status
+
+    CURRENT_TEST="current self-update reports a service refresh failure accurately"
+    home="$(new_commit_home self-update-current-service-failure)"
+    mkdir -p "$bin"
+    cp "$AGENTSMD" "$executable"
+    chmod 755 "$executable"
+    make_fake_curl "$bin"
+    make_fake_launchctl "$bin"
+
+    PATH="$bin:/usr/bin:/bin" \
+    FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+    HOME="$home" \
+        "$executable" service install >/dev/null
+
+    plist="$(
+        find "$home/Library/LaunchAgents" -maxdepth 1 -type f \
+            -name '*.plist' -print -quit
+    )"
+    [[ -n "$plist" ]] || fail "service install did not create a LaunchAgent plist"
+    /usr/bin/plutil -remove EnvironmentVariables.AGENTSMD_CONFIG_FILE "$plist"
+
+    set +e
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        FAKE_LAUNCHCTL_FAIL_BOOTSTRAP=1 \
+        FAKE_LAUNCHCTL_LOG="$launchctl_log" \
+        HOME="$home" \
+        AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+        FAKE_UPDATE_SOURCE="$AGENTSMD" \
+            "$executable" self-update 2>&1
+    )"
+    status=$?
+    set -e
+
+    [[ "$status" -eq 1 ]] || \
+        fail "current self-update succeeded after service refresh failed"
+    assert_contains "$output" "already up to date"
+    assert_contains "$output" "agentsmd is current, but the service could not be refreshed"
+    if [[ "$output" == *"agentsmd updated, but"* ]]; then
+        fail "current self-update claimed the executable was updated"
+    fi
+    [[ -z "$(find "$bin" -maxdepth 1 -name 'agentsmd.*.bak' -print -quit)" ]] || \
+        fail "failed current self-update created an executable backup"
+    cmp -s "$executable" "$AGENTSMD" || \
+        fail "failed current self-update changed the executable"
+
+    pass
+}
+
 test_self_update_does_not_refresh_service_for_other_executable() {
     local base="$TEST_ROOT/self-update-other-service"
     local home
@@ -1355,7 +1501,7 @@ test_status_summarizes_service_state() {
     pass
 }
 
-printf '1..31\n'
+printf '1..33\n'
 test_configured_shared_source_is_used_for_builds
 test_config_discovers_checkout_from_shared_symlink
 test_install_repairs_the_configured_shared_alias
@@ -1383,6 +1529,8 @@ test_self_update_rejects_unexpected_content
 test_self_update_rejects_symlinked_executable
 test_self_update_refreshes_loaded_service_with_saved_paths
 test_self_update_migrates_legacy_service_config_path
+test_current_self_update_repairs_legacy_service
+test_current_self_update_reports_service_refresh_failure
 test_self_update_does_not_refresh_service_for_other_executable
 test_install_downloads_from_uncached_main_url
 test_self_update_downloads_from_uncached_main_url
