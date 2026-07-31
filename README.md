@@ -19,16 +19,22 @@ a just-pushed version is downloaded instead of an older raw branch response.
 ```bash
 agentsmd status
 agentsmd build
+agentsmd commit
 agentsmd install
 agentsmd self-update
 agentsmd service install
 ```
 
-- `status` shows the source files, whether `~/AGENTS.md` is current, the
-  harness symlinks, and whether the background service is running.
+- `status` shows the configured shared repository, uncommitted shared changes,
+  source files, whether `~/AGENTS.md` is current, the harness symlinks, and
+  whether the background service is running.
 - `build` previews the generated diff and requires approval before changing
-  `~/AGENTS.md`.
-- `install` previews and creates the harness symlinks after approval.
+  `~/AGENTS.md`. The generated file includes a do-not-edit warning, the rebuild
+  command, and labeled boundaries around each source.
+- `commit` previews the configured shared source diff and requires approval
+  before committing and pushing it.
+- `install` previews and creates the configured shared-source and harness
+  symlinks after approval.
 - `self-update` downloads and installs the latest `agentsmd` command.
 - `service install` installs a per-user macOS LaunchAgent. It rebuilds the
   generated file at login and whenever either source file changes.
@@ -36,7 +42,56 @@ agentsmd service install
 The default source files are:
 
 - `~/AGENTS.shared.md` for instructions shared across computers
-- `~/AGENTS.local.md` for machine-specific or sensitive instructions
+- `~/AGENTS.local.md` for machine-specific or private instructions
+
+`agentsmd` preserves the source order and content: shared first, then local.
+Edit the source files rather than `~/AGENTS.md`, then run `agentsmd build`.
+
+## Configure the shared repository
+
+Create `~/agentsmd/config.toml`:
+
+```toml
+[shared]
+repository = "https://github.com/<owner>/<repository>.git"
+path = "AGENTS.shared.md"
+checkout = "~/github.com/<owner>/<repository>"
+```
+
+`repository` is the Git remote that receives shared-source commits. `path` is
+the source file inside that repository. `checkout` is optional. When it is
+omitted, `agentsmd` first reuses the checkout behind an existing
+`~/AGENTS.shared.md` symlink when it matches the configured repository and path.
+Otherwise it expects a managed checkout under
+`~/agentsmd/repos/<owner>/<repository>`.
+
+When this config exists, the repository file becomes the shared source used by
+`build`, `status`, and the background service. `agentsmd install` creates or
+repairs `~/AGENTS.shared.md` as a stable edit-path symlink to that file.
+
+## Commit shared instructions
+
+```bash
+agentsmd commit
+```
+
+`commit` fetches the current branch from the configured remote, refuses to
+continue when the checkout is ahead, behind, or diverged, and shows the complete
+uncommitted diff for only the configured shared source. After the full word
+`yes`, it commits only that file with an `Update <filename>` message and pushes
+the current branch. Other staged or unstaged files are left alone.
+
+If the push fails, the local commit is kept and the command reports that it was
+not pushed. Run this silent check from prompt integrations:
+
+```bash
+agentsmd commit --check
+```
+
+It exits 0 when the configured source has uncommitted changes, 1 when it is
+clean, and 2 when configuration or the source checkout is unavailable. It
+writes nothing in every state and does not fetch or change files. Use
+`agentsmd status` for human-readable diagnostics.
 
 ## Update agentsmd
 
@@ -98,5 +153,5 @@ the history and logs so they remain available for troubleshooting.
 The LaunchAgent plist, history, and log files use owner-only permissions. Keep
 in mind that build errors can still include configured file paths.
 
-If you manually move the `agentsmd` executable or change a configured source or
+If you manually move the `agentsmd` executable or change the config, source, or
 output path, run `agentsmd service install` again to update the LaunchAgent.

@@ -4,6 +4,8 @@ set -euo pipefail
 umask 077
 
 PROGRAM_NAME="agentsmd"
+DEFAULT_CONFIG_RELATIVE_PATH="agentsmd/config.toml"
+CONFIG_FILE="${AGENTSMD_CONFIG_FILE:-$HOME/$DEFAULT_CONFIG_RELATIVE_PATH}"
 SHARED_FILE="${AGENTSMD_SHARED_FILE:-$HOME/AGENTS.shared.md}"
 LOCAL_FILE="${AGENTSMD_LOCAL_FILE:-$HOME/AGENTS.local.md}"
 OUTPUT_FILE="${AGENTSMD_OUTPUT_FILE:-$HOME/AGENTS.md}"
@@ -26,6 +28,12 @@ fi
 SERVICE_RUN_ACTIVE=0
 SERVICE_RUN_COMPLETED=0
 SERVICE_RUN_FAILURE_MESSAGE="service build failed"
+CONFIG_SHARED_ACTIVE=0
+CONFIG_SHARED_REPOSITORY=""
+CONFIG_SHARED_PATH=""
+CONFIG_SHARED_CHECKOUT=""
+CONFIG_SHARED_TARGET=""
+CHECK_MODE=0
 
 # Bash 3.2 treats an empty array as unset under `set -u`. Keep an empty
 # sentinel so cleanup is safe before the first temporary path is registered.
@@ -70,37 +78,49 @@ Usage:
   $PROGRAM_NAME <command>
 
 Commands:
-  status       Show generated file, harness links, and service state
+  status       Show shared-source, generated-file, link, and service state
   build        Show the proposed AGENTS.md diff and apply it after approval
-  install      Create or repair the supported harness links
+  commit       Review, commit, and push shared-source changes
+  install      Create or repair the shared-source and harness links
   self-update  Update the agentsmd command itself
   service      Manage automatic background builds on macOS
   help         Show this help text
 
 Files:
+  Configuration:  $(display_path "$CONFIG_FILE")
   Shared source:  $(display_path "$SHARED_FILE")
   Local source:   $(display_path "$LOCAL_FILE")
   Generated file: $(display_path "$OUTPUT_FILE")
   Backups:        $(display_path "$BACKUP_HOME")
   Service state:  $(display_path "$SERVICE_STATE_HOME")
 
-The generated file is local build output. It may contain private local
-instructions, so agentsmd writes it with owner-only permissions.
+The generated file is local build output. It starts with a do-not-edit warning
+and wraps the shared and local source content in labeled boundary markers. It
+may contain private local instructions, so agentsmd writes it with owner-only
+permissions.
 
 Typical workflow:
-  1. Create AGENTS.shared.md and AGENTS.local.md.
+  1. Configure the shared repository and create AGENTS.local.md.
   2. Run "$PROGRAM_NAME build" and review the proposed diff.
-  3. Run "$PROGRAM_NAME install" once to connect the supported harnesses.
-  4. Run "$PROGRAM_NAME status" whenever you want to check for drift.
-  5. Optionally run "$PROGRAM_NAME service install" for automatic builds.
+  3. Run "$PROGRAM_NAME install" once to connect the source and harness links.
+  4. Run "$PROGRAM_NAME commit" after editing shared instructions.
+  5. Run "$PROGRAM_NAME status" whenever you want to check for drift.
+  6. Optionally run "$PROGRAM_NAME service install" for automatic builds.
 
-The build command combines AGENTS.shared.md followed by AGENTS.local.md. It
-shows the proposed change with "git diff --no-index" and only applies it after
-you enter the full word "yes". The diff may contain private local instructions.
+The build command combines AGENTS.shared.md followed by AGENTS.local.md without
+changing their content. It shows the proposed change with "git diff --no-index"
+and only applies it after you enter the full word "yes". The diff may contain
+private local instructions.
 
-The install command points each supported harness directly at the generated
-file. It backs up every file or link that it replaces and also requires you to
-enter "yes".
+The commit command reads the shared repository from config.toml, shows only the
+configured source file's uncommitted diff, and requires the full word "yes"
+before it creates and pushes a commit. Run "$PROGRAM_NAME commit --check" for a
+silent prompt check: exit 0 means commit is needed, exit 1 means it is clean,
+and exit 2 means the configured source is unavailable.
+
+The install command points ~/AGENTS.shared.md at the configured repository file
+and each supported harness at the generated file. It backs up every file or
+link that it replaces and also requires you to enter "yes".
 
 The self-update command downloads the latest agentsmd command, validates it,
 backs up the current executable, and replaces it atomically. If the macOS
@@ -112,6 +132,7 @@ file at login and whenever either source file changes. Run
 on Linux or Windows.
 
 Optional environment variables:
+  AGENTSMD_CONFIG_FILE  Override the configuration path
   AGENTSMD_SHARED_FILE  Override the shared source path
   AGENTSMD_LOCAL_FILE   Override the local source path
   AGENTSMD_OUTPUT_FILE  Override the generated file path
@@ -120,7 +141,8 @@ Optional environment variables:
   AGENTSMD_UPDATE_URL   Override the self-update download URL
   XDG_CACHE_HOME        Override the default backup directory
 
-Only self-update makes a network request. No command pulls, pushes, or commits.
+The commit and self-update commands make network requests. No other command
+pulls, pushes, or commits.
 EOF
 }
 
@@ -156,6 +178,9 @@ EOF
 }
 
 die() {
+    if [[ "$CHECK_MODE" -eq 1 ]]; then
+        exit 2
+    fi
     if [[ "$SERVICE_RUN_ACTIVE" -eq 1 ]]; then
         SERVICE_RUN_FAILURE_MESSAGE="$*"
     fi
@@ -177,6 +202,232 @@ display_path() {
             printf '%s' "$file_path"
             ;;
     esac
+}
+
+config_value() {
+    local key="$1"
+    local required="$2"
+    local value=""
+
+    if value="$(git config --file "$CONFIG_FILE" --get-all "$key" 2>/dev/null)"; then
+        if [[ -z "$value" ]]; then
+            die "configuration value is empty: $key"
+        fi
+        case "$value" in
+            *$'\n'*|*$'\r'*)
+                die "configuration value must be set once without line breaks: $key"
+                ;;
+        esac
+        printf '%s' "$value"
+        return
+    fi
+
+    if [[ "$required" -eq 1 ]]; then
+        die "configuration value is required: $key"
+    fi
+}
+
+normalize_repository_url() {
+    local repository="${1%/}"
+
+    repository="${repository%.git}"
+    case "$repository" in
+        https://github.com/*)
+            printf 'github:%s' "${repository#https://github.com/}"
+            ;;
+        http://github.com/*)
+            printf 'github:%s' "${repository#http://github.com/}"
+            ;;
+        git@github.com:*)
+            printf 'github:%s' "${repository#git@github.com:}"
+            ;;
+        ssh://git@github.com/*)
+            printf 'github:%s' "${repository#ssh://git@github.com/}"
+            ;;
+        file://*)
+            printf 'file:%s' "${repository#file://}"
+            ;;
+        *)
+            printf '%s' "$repository"
+            ;;
+    esac
+}
+
+repository_urls_match() {
+    local first="$1"
+    local second="$2"
+
+    [[ "$(normalize_repository_url "$first")" == "$(normalize_repository_url "$second")" ]]
+}
+
+configured_remote_name() {
+    local checkout="$1"
+    local remote
+    local remote_url
+
+    if remote_url="$(git -C "$checkout" remote get-url origin 2>/dev/null)" && \
+       repository_urls_match "$remote_url" "$CONFIG_SHARED_REPOSITORY"; then
+        printf 'origin'
+        return
+    fi
+
+    while IFS= read -r remote; do
+        [[ -n "$remote" && "$remote" != "origin" ]] || continue
+        remote_url="$(git -C "$checkout" remote get-url "$remote" 2>/dev/null || true)"
+        if [[ -n "$remote_url" ]] && repository_urls_match "$remote_url" "$CONFIG_SHARED_REPOSITORY"; then
+            printf '%s' "$remote"
+            return
+        fi
+    done < <(git -C "$checkout" remote 2>/dev/null || true)
+
+    return 1
+}
+
+configured_checkout_from_shared_link() {
+    local shared_alias="$HOME/AGENTS.shared.md"
+    local shared_target
+    local checkout
+    local relative_path
+
+    [[ -L "$shared_alias" ]] || return 1
+    shared_target="$(resolve_path "$shared_alias" || true)"
+    [[ -n "$shared_target" ]] || return 1
+    checkout="$(git -C "$(dirname "$shared_target")" rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ -n "$checkout" ]] || return 1
+    relative_path="${shared_target#"$checkout"/}"
+    [[ "$relative_path" == "$CONFIG_SHARED_PATH" ]] || return 1
+    configured_remote_name "$checkout" >/dev/null || return 1
+    printf '%s' "$checkout"
+}
+
+default_configured_checkout() {
+    local repository
+    local owner
+    local name
+
+    repository="$(normalize_repository_url "$CONFIG_SHARED_REPOSITORY")"
+    case "$repository" in
+        github:*/*)
+            repository="${repository#github:}"
+            owner="${repository%%/*}"
+            name="${repository#*/}"
+            printf '%s/agentsmd/repos/%s/%s' "$HOME" "$owner" "$name"
+            ;;
+        *)
+            repository="${CONFIG_SHARED_REPOSITORY%/}"
+            repository="${repository%.git}"
+            name="${repository##*/}"
+            [[ -n "$name" ]] || die "could not derive a checkout name from shared.repository"
+            printf '%s/agentsmd/repos/%s' "$HOME" "$name"
+            ;;
+    esac
+}
+
+validate_configured_relative_path() {
+    case "$CONFIG_SHARED_PATH" in
+        ""|/*|.|..|./*|../*|*/../*|*/..|*/.|*//*|*$'\n'*|*$'\r'*|*\\*)
+            die "shared.path must be a normalized relative repository path"
+            ;;
+    esac
+}
+
+expand_configured_checkout() {
+    local checkout="$1"
+
+    case "$checkout" in
+        "~")
+            printf '%s' "$HOME"
+            ;;
+        "~/"*)
+            printf '%s/%s' "$HOME" "${checkout#"~/"}"
+            ;;
+        /*)
+            printf '%s' "$checkout"
+            ;;
+        *)
+            die "shared.checkout must be an absolute path or start with ~/"
+            ;;
+    esac
+}
+
+load_config() {
+    local configured_checkout=""
+
+    if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
+        return
+    fi
+    if [[ ! -f "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+        die "configuration is not a readable regular file: $(display_path "$CONFIG_FILE")"
+    fi
+
+    command -v git >/dev/null 2>&1 || die "git is required to read $(display_path "$CONFIG_FILE")"
+    if ! git config --file "$CONFIG_FILE" --list >/dev/null 2>&1; then
+        die "configuration is not valid: $(display_path "$CONFIG_FILE")"
+    fi
+
+    CONFIG_SHARED_REPOSITORY="$(config_value shared.repository 1)"
+    CONFIG_SHARED_PATH="$(config_value shared.path 1)"
+    validate_configured_relative_path
+    configured_checkout="$(config_value shared.checkout 0)"
+
+    CONFIG_SHARED_ACTIVE=1
+    if [[ -n "$configured_checkout" ]]; then
+        CONFIG_SHARED_CHECKOUT="$(expand_configured_checkout "$configured_checkout")"
+    elif CONFIG_SHARED_CHECKOUT="$(configured_checkout_from_shared_link)"; then
+        :
+    else
+        CONFIG_SHARED_CHECKOUT="$(default_configured_checkout)"
+    fi
+
+    CONFIG_SHARED_TARGET="$CONFIG_SHARED_CHECKOUT/$CONFIG_SHARED_PATH"
+    if [[ -z "${AGENTSMD_SHARED_FILE+x}" ]]; then
+        SHARED_FILE="$CONFIG_SHARED_TARGET"
+    fi
+}
+
+validate_configured_shared_source() {
+    local checkout_root
+    local configured_root
+    local remote
+
+    [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]] || \
+        die "shared repository is not configured: $(display_path "$CONFIG_FILE")"
+    [[ -d "$CONFIG_SHARED_CHECKOUT" ]] || \
+        die "configured shared checkout is missing: $(display_path "$CONFIG_SHARED_CHECKOUT")"
+
+    checkout_root="$(git -C "$CONFIG_SHARED_CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)"
+    configured_root="$(cd -P "$CONFIG_SHARED_CHECKOUT" 2>/dev/null && pwd)"
+    [[ "$checkout_root" == "$configured_root" ]] || \
+        die "shared.checkout is not a Git repository root: $(display_path "$CONFIG_SHARED_CHECKOUT")"
+    remote="$(configured_remote_name "$CONFIG_SHARED_CHECKOUT" || true)"
+    [[ -n "$remote" ]] || \
+        die "configured shared checkout has no remote matching shared.repository"
+    [[ -f "$CONFIG_SHARED_TARGET" && -r "$CONFIG_SHARED_TARGET" ]] || \
+        die "configured shared source is missing or unreadable: $(display_path "$CONFIG_SHARED_TARGET")"
+}
+
+configured_shared_source_ready() {
+    local checkout_root
+    local configured_root
+
+    [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]] || return 1
+    [[ -d "$CONFIG_SHARED_CHECKOUT" ]] || return 1
+    checkout_root="$(git -C "$CONFIG_SHARED_CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)"
+    configured_root="$(cd -P "$CONFIG_SHARED_CHECKOUT" 2>/dev/null && pwd)"
+    [[ "$checkout_root" == "$configured_root" ]] || return 1
+    configured_remote_name "$CONFIG_SHARED_CHECKOUT" >/dev/null || return 1
+    [[ -f "$CONFIG_SHARED_TARGET" && -r "$CONFIG_SHARED_TARGET" ]]
+}
+
+configured_shared_alias_matches() {
+    local shared_alias="$HOME/AGENTS.shared.md"
+    local resolved_alias
+    local resolved_target
+
+    [[ -L "$shared_alias" ]] || return 1
+    resolved_alias="$(resolve_path "$shared_alias" || true)"
+    resolved_target="$(resolve_path "$CONFIG_SHARED_TARGET" || true)"
+    [[ -n "$resolved_alias" && "$resolved_alias" == "$resolved_target" ]]
 }
 
 new_temp_dir() {
@@ -256,7 +507,7 @@ validate_paths() {
     local configured_path
     local source_path
 
-    for configured_path in "$SHARED_FILE" "$LOCAL_FILE" "$OUTPUT_FILE"; do
+    for configured_path in "$CONFIG_FILE" "$SHARED_FILE" "$LOCAL_FILE" "$OUTPUT_FILE"; do
         case "$configured_path" in
             /*) ;;
             *) die "configured paths must be absolute: $configured_path" ;;
@@ -334,13 +585,17 @@ write_candidate() {
     local destination="$1"
 
     {
-        printf '<!-- Generated by agentsmd. Do not edit directly.\n'
-        printf 'Edit ~/AGENTS.shared.md for shared instructions or ~/AGENTS.local.md for machine-specific or sensitive instructions.\n'
+        printf '<!-- Generated by agentsmd. Do not edit this file directly.\n'
+        printf 'Edit ~/AGENTS.shared.md for shared instructions.\n'
+        printf 'Edit ~/AGENTS.local.md for machine-specific or private instructions.\n'
+        printf 'Then run `agentsmd build`.\n'
         printf 'Version the source files, not this file. -->\n\n'
+        printf '<!-- BEGIN AGENTSMD SHARED SOURCE: ~/AGENTS.shared.md -->\n'
         cat "$SHARED_FILE"
-        printf '\n\n'
+        printf '\n<!-- END AGENTSMD SHARED SOURCE: ~/AGENTS.shared.md -->\n\n'
+        printf '<!-- BEGIN AGENTSMD LOCAL SOURCE: ~/AGENTS.local.md -->\n'
         cat "$LOCAL_FILE"
-        printf '\n'
+        printf '\n<!-- END AGENTSMD LOCAL SOURCE: ~/AGENTS.local.md -->\n'
     } >"$destination"
 }
 
@@ -577,6 +832,8 @@ write_service_plist() {
         <string>$(printf '%s' "$HOME" | xml_escape)</string>
         <key>PATH</key>
         <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>AGENTSMD_CONFIG_FILE</key>
+        <string>$(printf '%s' "$CONFIG_FILE" | xml_escape)</string>
         <key>AGENTSMD_SHARED_FILE</key>
         <string>$(printf '%s' "$SHARED_FILE" | xml_escape)</string>
         <key>AGENTSMD_LOCAL_FILE</key>
@@ -717,6 +974,9 @@ command_service_run() {
     SERVICE_RUN_ACTIVE=1
     SERVICE_RUN_FAILURE_MESSAGE="unattended build failed"
 
+    if [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]]; then
+        validate_configured_shared_source
+    fi
     if ! validate_sources; then
         SERVICE_RUN_FAILURE_MESSAGE="source files are missing or unreadable"
         return 1
@@ -811,6 +1071,9 @@ command_build() {
     local backup_file=""
     local backup_timestamp=""
 
+    if [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]]; then
+        validate_configured_shared_source
+    fi
     validate_sources || exit 1
     command -v git >/dev/null 2>&1 || die "git is required to show the build diff"
 
@@ -905,10 +1168,171 @@ command_build() {
     printf '\nBuilt %s.\n' "$(display_path "$OUTPUT_FILE")"
 }
 
+configured_source_has_changes() {
+    local status_output
+
+    if ! status_output="$(
+        git -C "$CONFIG_SHARED_CHECKOUT" --literal-pathspecs status \
+            --porcelain=v1 --untracked-files=all -- "$CONFIG_SHARED_PATH" 2>/dev/null
+    )"; then
+        return 2
+    fi
+    [[ -n "$status_output" ]]
+}
+
+show_configured_source_diff() {
+    git -C "$CONFIG_SHARED_CHECKOUT" --no-pager --literal-pathspecs diff \
+        --no-ext-diff --text HEAD -- "$CONFIG_SHARED_PATH"
+}
+
+configured_source_diff_hash() {
+    show_configured_source_diff | git hash-object --stdin
+}
+
+confirm_commit() {
+    local answer
+
+    cat <<'EOF'
+
+Do you want to commit and push this change?
+  agentsmd will commit only the configured shared source file.
+  Only "yes" will be accepted to approve.
+
+EOF
+    printf 'Enter a value: '
+    IFS= read -r answer || answer=""
+
+    [[ "$answer" == "yes" ]]
+}
+
+command_commit_check() {
+    local source_state
+
+    validate_configured_shared_source
+
+    if configured_source_has_changes; then
+        return 0
+    else
+        source_state=$?
+    fi
+    return "$source_state"
+}
+
+command_commit() {
+    local option="${1:-}"
+    local remote
+    local branch
+    local remote_ref
+    local counts
+    local ahead
+    local behind
+    local planned_head
+    local planned_diff_hash
+    local commit_message
+    local commit_oid
+    local source_state
+
+    case "$option" in
+        "")
+            ;;
+        --check)
+            command_commit_check
+            return
+            ;;
+        *)
+            die "unexpected argument: $option"
+            ;;
+    esac
+
+    validate_configured_shared_source
+    if ! git -C "$CONFIG_SHARED_CHECKOUT" --literal-pathspecs ls-files \
+        --error-unmatch -- "$CONFIG_SHARED_PATH" >/dev/null 2>&1; then
+        die "configured shared source is not tracked by Git: $(display_path "$CONFIG_SHARED_TARGET")"
+    fi
+    if configured_source_has_changes; then
+        :
+    else
+        source_state=$?
+        if [[ "$source_state" -eq 1 ]]; then
+            printf 'No changes. %s is already committed.\n' "$(display_path "$CONFIG_SHARED_TARGET")"
+            return
+        fi
+        die "could not inspect the configured shared source"
+    fi
+
+    branch="$(git -C "$CONFIG_SHARED_CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    [[ -n "$branch" ]] || die "configured shared checkout is in detached HEAD state"
+    remote="$(configured_remote_name "$CONFIG_SHARED_CHECKOUT" || true)"
+    [[ -n "$remote" ]] || die "configured shared checkout has no matching remote"
+
+    if ! git -C "$CONFIG_SHARED_CHECKOUT" fetch --quiet "$remote" "$branch"; then
+        die "could not fetch $remote/$branch before committing"
+    fi
+    remote_ref="refs/remotes/$remote/$branch"
+    if ! git -C "$CONFIG_SHARED_CHECKOUT" show-ref --verify --quiet "$remote_ref"; then
+        die "remote branch does not exist: $remote/$branch"
+    fi
+
+    counts="$(git -C "$CONFIG_SHARED_CHECKOUT" rev-list \
+        --left-right --count "HEAD...$remote_ref")"
+    ahead="${counts%%[[:space:]]*}"
+    behind="${counts##*[[:space:]]}"
+    if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+        die "configured shared checkout has diverged from $remote/$branch"
+    fi
+    if [[ "$ahead" -gt 0 ]]; then
+        die "configured shared checkout has unpushed commits; refusing to push them"
+    fi
+    if [[ "$behind" -gt 0 ]]; then
+        die "configured shared checkout is behind $remote/$branch; update it first"
+    fi
+
+    planned_head="$(git -C "$CONFIG_SHARED_CHECKOUT" rev-parse HEAD)"
+    planned_diff_hash="$(configured_source_diff_hash)"
+    commit_message="Update $(basename "$CONFIG_SHARED_PATH")"
+
+    printf 'agentsmd will perform the following actions:\n\n'
+    printf '  commit only %s\n' "$(display_path "$CONFIG_SHARED_TARGET")"
+    printf '  push branch %s to %s\n' "$branch" "$remote"
+    printf '\nRepository: %s\n' "$(display_path "$CONFIG_SHARED_CHECKOUT")"
+    printf 'Commit:     %s\n' "$commit_message"
+    printf '\nProposed source changes:\n\n'
+    show_configured_source_diff
+
+    if ! confirm_commit; then
+        printf '\nCommit cancelled. No files were changed.\n'
+        return
+    fi
+
+    if [[ "$(git -C "$CONFIG_SHARED_CHECKOUT" rev-parse HEAD)" != "$planned_head" ]]; then
+        die "repository HEAD changed while awaiting approval; run $PROGRAM_NAME commit again"
+    fi
+    if [[ "$(configured_source_diff_hash)" != "$planned_diff_hash" ]]; then
+        die "shared source changed while awaiting approval; run $PROGRAM_NAME commit again"
+    fi
+
+    if ! git -C "$CONFIG_SHARED_CHECKOUT" --literal-pathspecs commit \
+        --only --message "$commit_message" -- "$CONFIG_SHARED_PATH"; then
+        die "could not commit the configured shared source"
+    fi
+    commit_oid="$(git -C "$CONFIG_SHARED_CHECKOUT" rev-parse --short HEAD)"
+
+    if ! git -C "$CONFIG_SHARED_CHECKOUT" push \
+        "$remote" "HEAD:refs/heads/$branch"; then
+        printf 'error: committed %s locally, but the push to %s/%s failed\n' \
+            "$commit_oid" "$remote" "$branch" >&2
+        return 1
+    fi
+
+    printf '\nCommitted and pushed %s (%s).\n' \
+        "$(display_path "$CONFIG_SHARED_TARGET")" "$commit_oid"
+}
+
 command_status() {
     local workspace
     local candidate
     local sources_ready=0
+    local source_state
     local link_index
     local link_path
     local link_target
@@ -925,7 +1349,40 @@ command_status() {
         "$HOME/.pi/agent/AGENTS.md"
     )
 
-    printf 'Sources\n'
+    printf 'Configuration\n'
+    if [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]]; then
+        printf '✅ Config:     %s\n' "$(display_path "$CONFIG_FILE")"
+        printf '   Repository: %s\n' "$CONFIG_SHARED_REPOSITORY"
+        printf '   Checkout:   %s\n' "$(display_path "$CONFIG_SHARED_CHECKOUT")"
+        printf '   Source:     %s\n' "$CONFIG_SHARED_PATH"
+        if configured_shared_source_ready; then
+            printf '✅ Managed shared source is ready\n'
+            if configured_shared_alias_matches; then
+                printf '✅ Alias:      ~/AGENTS.shared.md -> %s\n' \
+                    "$(display_path "$CONFIG_SHARED_TARGET")"
+            else
+                printf '⚠️  Alias:      ~/AGENTS.shared.md does not point to the configured source\n'
+            fi
+            if configured_source_has_changes; then
+                printf '⚠️  Shared changes need: %s commit\n' "$PROGRAM_NAME"
+            else
+                source_state=$?
+                if [[ "$source_state" -eq 1 ]]; then
+                    printf '✅ Shared source has no uncommitted changes\n'
+                else
+                    printf '⚠️  Shared source changes could not be inspected\n'
+                fi
+            fi
+        else
+            printf '⚠️  Managed shared source is not ready; check the configured checkout and remote\n'
+        fi
+    elif [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+        printf '⚠️  Config could not be loaded: %s\n' "$(display_path "$CONFIG_FILE")"
+    else
+        printf 'ℹ️  Not configured: %s\n' "$(display_path "$CONFIG_FILE")"
+    fi
+
+    printf '\nSources\n'
     if [[ -f "$SHARED_FILE" && -r "$SHARED_FILE" ]]; then
         printf '✅ Shared: %s\n' "$(display_path "$SHARED_FILE")"
     else
@@ -1025,6 +1482,8 @@ command_install() {
     local link_path
     local link_target
     local changes=0
+    local shared_alias="$HOME/AGENTS.shared.md"
+    local shared_alias_change=0
     local backup_file
     local backup_timestamp=""
     local backups_started=0
@@ -1041,11 +1500,32 @@ command_install() {
         "$HOME/.pi/agent/AGENTS.md"
     )
 
+    if [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]]; then
+        validate_configured_shared_source
+        if ! configured_shared_alias_matches; then
+            if [[ -d "$shared_alias" && ! -L "$shared_alias" ]]; then
+                die "refusing to replace directory: $(display_path "$shared_alias")"
+            fi
+            shared_alias_change=1
+        fi
+    fi
+
     if [[ ! -f "$OUTPUT_FILE" || -L "$OUTPUT_FILE" ]]; then
         die "generated file is missing; run: $PROGRAM_NAME build"
     fi
 
     printf 'agentsmd will perform the following actions:\n\n'
+
+    if [[ "$shared_alias_change" -eq 1 ]]; then
+        changes=$((changes + 1))
+        if [[ -e "$shared_alias" || -L "$shared_alias" ]]; then
+            printf '  back up and replace %s for the configured shared source\n' \
+                "$(display_path "$shared_alias")"
+        else
+            printf '  create %s for the configured shared source\n' \
+                "$(display_path "$shared_alias")"
+        fi
+    fi
 
     for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++)); do
         link_path="${link_paths[$link_index]}"
@@ -1068,15 +1548,35 @@ command_install() {
     done
 
     if [[ "$changes" -eq 0 ]]; then
-        printf '  No changes. All harness links are installed.\n'
+        printf '  No changes. All configured links are installed.\n'
         return
     fi
 
-    printf '\nEvery link will point directly to %s.\n' "$(display_path "$OUTPUT_FILE")"
+    if [[ "$shared_alias_change" -eq 1 ]]; then
+        printf '\nThe shared alias will point directly to %s.\n' \
+            "$(display_path "$CONFIG_SHARED_TARGET")"
+    fi
+    printf 'Every harness link will point directly to %s.\n' \
+        "$(display_path "$OUTPUT_FILE")"
 
     if ! confirm_apply; then
         printf '\nInstall cancelled. No files were changed.\n'
         return
+    fi
+
+    if [[ "$shared_alias_change" -eq 1 ]]; then
+        if [[ -e "$shared_alias" || -L "$shared_alias" ]]; then
+            if [[ -z "$backup_timestamp" ]]; then
+                ensure_backup_home
+                backup_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            fi
+            backup_file="$(backup_item "$shared_alias" "$backup_timestamp")"
+            printf '\nBackups:\n'
+            backups_started=1
+            printf '  %s\n' "$(display_path "$backup_file")"
+            rm "$shared_alias"
+        fi
+        ln -s "$CONFIG_SHARED_TARGET" "$shared_alias"
     fi
 
     for ((link_index = 0; link_index < ${#link_paths[@]}; link_index++)); do
@@ -1108,7 +1608,7 @@ command_install() {
         ln -s "$OUTPUT_FILE" "$link_path"
     done
 
-    printf 'Installed harness links.\n'
+    printf 'Installed configured links.\n'
 }
 
 command_self_update() {
@@ -1167,6 +1667,7 @@ refresh_service_after_update() {
     local command_path="$1"
     local configured_program=""
     local service_home=""
+    local service_config=""
     local service_shared=""
     local service_local=""
     local service_output=""
@@ -1188,6 +1689,12 @@ refresh_service_after_update() {
     service_home="$(
         plutil -extract EnvironmentVariables.HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
     )"
+    service_config="$(
+        plutil -extract EnvironmentVariables.AGENTSMD_CONFIG_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true
+    )"
+    if [[ -z "$service_config" && -n "$service_home" ]]; then
+        service_config="$service_home/$DEFAULT_CONFIG_RELATIVE_PATH"
+    fi
     service_shared="$(
         plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true
     )"
@@ -1207,13 +1714,15 @@ refresh_service_after_update() {
         plutil -extract EnvironmentVariables.XDG_CACHE_HOME raw -o - "$SERVICE_PLIST" 2>/dev/null || true
     )"
 
-    if [[ -z "$service_home" || -z "$service_shared" || -z "$service_local" || \
+    if [[ -z "$service_home" || -z "$service_config" || -z "$service_shared" || \
+          -z "$service_local" || \
           -z "$service_output" || -z "$service_state" || -z "$service_logs" || \
           -z "$service_cache" ]]; then
         return 1
     fi
 
     HOME="$service_home" \
+    AGENTSMD_CONFIG_FILE="$service_config" \
     AGENTSMD_SHARED_FILE="$service_shared" \
     AGENTSMD_LOCAL_FILE="$service_local" \
     AGENTSMD_OUTPUT_FILE="$service_output" \
@@ -1239,6 +1748,9 @@ command_service_install() {
 
     command -v launchctl >/dev/null 2>&1 || die "launchctl is required"
     command -v plutil >/dev/null 2>&1 || die "plutil is required"
+    if [[ "$CONFIG_SHARED_ACTIVE" -eq 1 ]]; then
+        validate_configured_shared_source
+    fi
     validate_sources || exit 1
     program_path="$(service_program_path)"
     if [[ ! -f "$program_path" || ! -x "$program_path" ]]; then
@@ -1442,6 +1954,7 @@ command_service_doctor() {
     local workspace
     local expected_plist
     local configured_program=""
+    local configured_config=""
     local configured_shared=""
     local configured_local=""
     local configured_output=""
@@ -1529,6 +2042,7 @@ command_service_doctor() {
         fi
 
         configured_program="$(plutil -extract ProgramArguments.1 raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
+        configured_config="$(plutil -extract EnvironmentVariables.AGENTSMD_CONFIG_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
         configured_shared="$(plutil -extract EnvironmentVariables.AGENTSMD_SHARED_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
         configured_local="$(plutil -extract EnvironmentVariables.AGENTSMD_LOCAL_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
         configured_output="$(plutil -extract EnvironmentVariables.AGENTSMD_OUTPUT_FILE raw -o - "$SERVICE_PLIST" 2>/dev/null || true)"
@@ -1540,7 +2054,8 @@ command_service_doctor() {
             doctor_check "❌" "configured command is missing or changed: $(display_path "$configured_program")"
             failed=1
         fi
-        if [[ "$configured_shared" != "$SHARED_FILE" || \
+        if [[ "$configured_config" != "$CONFIG_FILE" || \
+              "$configured_shared" != "$SHARED_FILE" || \
               "$configured_local" != "$LOCAL_FILE" || \
               "$configured_output" != "$OUTPUT_FILE" ]]; then
             doctor_check "❌" "configured paths do not match the current environment"
@@ -1753,11 +2268,32 @@ command_service() {
 main() {
     local command="${1:-help}"
 
+    if [[ "$command" == "commit" && "${2:-}" == "--check" ]]; then
+        CHECK_MODE=1
+    fi
+    case "$command" in
+        help|-h|--help|self-update)
+            ;;
+        *)
+            load_config
+            ;;
+    esac
     validate_paths
 
-    if [[ "$command" != "service" && "$#" -gt 1 ]]; then
-        die "unexpected argument: $2"
-    fi
+    case "$command" in
+        service)
+            ;;
+        commit)
+            if [[ "$#" -gt 2 ]]; then
+                die "unexpected argument: $3"
+            fi
+            ;;
+        *)
+            if [[ "$#" -gt 1 ]]; then
+                die "unexpected argument: $2"
+            fi
+            ;;
+    esac
 
     case "$command" in
         status)
@@ -1765,6 +2301,9 @@ main() {
             ;;
         build)
             command_build
+            ;;
+        commit)
+            command_commit "${2:-}"
             ;;
         install)
             command_install
