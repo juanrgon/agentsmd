@@ -18,6 +18,7 @@ a just-pushed version is downloaded instead of an older raw branch response.
 
 ```bash
 agentsmd status
+agentsmd code
 agentsmd build
 agentsmd commit
 agentsmd install
@@ -28,6 +29,8 @@ agentsmd service install
 - `status` shows the configured shared repository, uncommitted shared changes,
   source files, whether `~/AGENTS.md` is current, the harness symlinks, and
   whether the background service is running.
+- `code` opens the editable shared and local sources plus `~/.agents/skills` in
+  one VS Code CLI invocation. It does not open the generated `~/AGENTS.md`.
 - `build` previews the generated diff and requires approval before changing
   `~/AGENTS.md`. The generated file includes a do-not-edit warning, the rebuild
   command, and labeled boundaries around each source.
@@ -46,6 +49,8 @@ The default source files are:
 
 `agentsmd` preserves the source order and content: shared first, then local.
 Edit the source files rather than `~/AGENTS.md`, then run `agentsmd build`.
+`agentsmd code` honors `AGENTSMD_SHARED_FILE`, `AGENTSMD_LOCAL_FILE`, and the
+repository-backed shared source configured in `~/agentsmd/config.toml`.
 
 ## Configure the shared repository
 

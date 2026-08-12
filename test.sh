@@ -93,6 +93,167 @@ run_commit() {
     HOME="$home" "$AGENTSMD" commit "$@"
 }
 
+make_fake_code() {
+    local bin="$1"
+
+    mkdir -p "$bin"
+    cat >"$bin/code" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+printf 'call\n' >>"$FAKE_CODE_LOG"
+printf 'arg=%s\n' "$@" >>"$FAKE_CODE_LOG"
+EOF
+    chmod 755 "$bin/code"
+}
+
+test_code_opens_overridden_sources_and_skills_once() {
+    local base="$TEST_ROOT/code paths with spaces"
+    local home
+    local bin="$base/bin"
+    local shared
+    local local_file
+    local skills
+    local code_log="$base/code.log"
+    local expected="$base/expected.log"
+    local output
+
+    CURRENT_TEST="code opens overridden editable sources and canonical skills once"
+    home="$(new_home "code paths with spaces")"
+    shared="$home/editable shared.md"
+    local_file="$home/editable local.md"
+    skills="$home/.agents/skills"
+    mv "$home/AGENTS.shared.md" "$shared"
+    mv "$home/AGENTS.local.md" "$local_file"
+    mkdir -p "$skills"
+    make_fake_code "$bin"
+
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        HOME="$home" \
+        AGENTSMD_SHARED_FILE="$shared" \
+        AGENTSMD_LOCAL_FILE="$local_file" \
+        FAKE_CODE_LOG="$code_log" \
+            "$AGENTSMD" code
+    )"
+    {
+        printf 'call\n'
+        printf 'arg=%s\n' "$shared" "$local_file" "$skills"
+    } >"$expected"
+
+    [[ -z "$output" ]] || fail "code command wrote unexpected output"
+    if ! cmp -s "$code_log" "$expected"; then
+        diff -u "$expected" "$code_log" >&2 || true
+        fail "code was not invoked once with the exact expected arguments"
+    fi
+
+    pass
+}
+
+test_code_uses_repository_backed_shared_source() {
+    local base="$TEST_ROOT/code-configured-source"
+    local home
+    local bin="$base/bin"
+    local checkout="$base/checkout"
+    local skills
+    local code_log="$base/code.log"
+    local expected="$base/expected.log"
+
+    CURRENT_TEST="code opens the repository-backed shared source"
+    home="$(new_commit_home code-configured-source)"
+    skills="$home/.agents/skills"
+    mkdir -p "$skills"
+    make_fake_code "$bin"
+
+    PATH="$bin:/usr/bin:/bin" \
+    HOME="$home" \
+    FAKE_CODE_LOG="$code_log" \
+        "$AGENTSMD" code
+    {
+        printf 'call\n'
+        printf 'arg=%s\n' "$checkout/AGENTS.shared.md" "$home/AGENTS.local.md" "$skills"
+    } >"$expected"
+
+    if ! cmp -s "$code_log" "$expected"; then
+        diff -u "$expected" "$code_log" >&2 || true
+        fail "code did not use the configured repository source"
+    fi
+
+    pass
+}
+
+test_code_rejects_missing_inputs() {
+    local base="$TEST_ROOT/code-missing-inputs"
+    local home
+    local bin="$base/bin"
+    local code_log="$base/code.log"
+    local output
+    local status
+
+    CURRENT_TEST="code reports missing editable sources and canonical skills"
+    home="$(new_home code-missing-inputs)"
+    mkdir -p "$home/.agents/skills"
+    make_fake_code "$bin"
+    rm "$home/AGENTS.local.md"
+
+    set +e
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        HOME="$home" \
+        FAKE_CODE_LOG="$code_log" \
+            "$AGENTSMD" code 2>&1
+    )"
+    status=$?
+    set -e
+    [[ "$status" -eq 1 ]] || fail "missing local source did not exit 1"
+    assert_contains "$output" "local source is missing or unreadable: ~/AGENTS.local.md"
+    [[ ! -e "$code_log" ]] || fail "code ran with a missing local source"
+
+    printf 'local instructions\n' >"$home/AGENTS.local.md"
+    rm -r "$home/.agents/skills"
+    set +e
+    output="$(
+        PATH="$bin:/usr/bin:/bin" \
+        HOME="$home" \
+        FAKE_CODE_LOG="$code_log" \
+            "$AGENTSMD" code 2>&1
+    )"
+    status=$?
+    set -e
+    [[ "$status" -eq 1 ]] || fail "missing skills directory did not exit 1"
+    assert_contains "$output" "canonical skills directory is missing or unreadable: ~/.agents/skills"
+    [[ ! -e "$code_log" ]] || fail "code ran with a missing skills directory"
+
+    pass
+}
+
+test_code_reports_missing_executable() {
+    local base="$TEST_ROOT/code-missing-executable"
+    local home
+    local bin="$base/bin"
+    local output
+    local status
+
+    CURRENT_TEST="code reports when the VS Code CLI is unavailable"
+    home="$(new_home code-missing-executable)"
+    mkdir -p "$home/.agents/skills" "$bin"
+    ln -s "$(command -v dirname)" "$bin/dirname"
+
+    set +e
+    output="$(
+        PATH="$bin" \
+        HOME="$home" \
+        AGENTSMD_UPDATE_URL="https://example.invalid/agentsmd" \
+            /bin/bash "$AGENTSMD" code 2>&1
+    )"
+    status=$?
+    set -e
+    [[ "$status" -eq 1 ]] || fail "missing code executable did not exit 1"
+    assert_contains "$output" "code is required to open the editable sources and canonical skills"
+
+    pass
+}
+
 test_configured_shared_source_is_used_for_builds() {
     local home
     local checkout
@@ -1501,7 +1662,11 @@ test_status_summarizes_service_state() {
     pass
 }
 
-printf '1..33\n'
+printf '1..37\n'
+test_code_opens_overridden_sources_and_skills_once
+test_code_uses_repository_backed_shared_source
+test_code_rejects_missing_inputs
+test_code_reports_missing_executable
 test_configured_shared_source_is_used_for_builds
 test_config_discovers_checkout_from_shared_symlink
 test_install_repairs_the_configured_shared_alias

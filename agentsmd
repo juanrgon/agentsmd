@@ -9,6 +9,7 @@ CONFIG_FILE="${AGENTSMD_CONFIG_FILE:-$HOME/$DEFAULT_CONFIG_RELATIVE_PATH}"
 SHARED_FILE="${AGENTSMD_SHARED_FILE:-$HOME/AGENTS.shared.md}"
 LOCAL_FILE="${AGENTSMD_LOCAL_FILE:-$HOME/AGENTS.local.md}"
 OUTPUT_FILE="${AGENTSMD_OUTPUT_FILE:-$HOME/AGENTS.md}"
+SKILLS_DIR="$HOME/.agents/skills"
 OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"
 BACKUP_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/agentsmd/backups"
 SERVICE_LABEL="com.juanrgon.agentsmd"
@@ -79,6 +80,7 @@ Usage:
 
 Commands:
   status       Show shared-source, generated-file, link, and service state
+  code         Open the editable sources and canonical skills in VS Code
   build        Show the proposed AGENTS.md diff and apply it after approval
   commit       Review, commit, and push shared-source changes
   install      Create or repair the shared-source and harness links
@@ -90,6 +92,7 @@ Files:
   Configuration:  $(display_path "$CONFIG_FILE")
   Shared source:  $(display_path "$SHARED_FILE")
   Local source:   $(display_path "$LOCAL_FILE")
+  Skills:         $(display_path "$SKILLS_DIR")
   Generated file: $(display_path "$OUTPUT_FILE")
   Backups:        $(display_path "$BACKUP_HOME")
   Service state:  $(display_path "$SERVICE_STATE_HOME")
@@ -101,11 +104,12 @@ permissions.
 
 Typical workflow:
   1. Configure the shared repository and create AGENTS.local.md.
-  2. Run "$PROGRAM_NAME build" and review the proposed diff.
-  3. Run "$PROGRAM_NAME install" once to connect the source and harness links.
-  4. Run "$PROGRAM_NAME commit" after editing shared instructions.
-  5. Run "$PROGRAM_NAME status" whenever you want to check for drift.
-  6. Optionally run "$PROGRAM_NAME service install" for automatic builds.
+  2. Run "$PROGRAM_NAME code" to edit the sources and canonical skills.
+  3. Run "$PROGRAM_NAME build" and review the proposed diff.
+  4. Run "$PROGRAM_NAME install" once to connect the source and harness links.
+  5. Run "$PROGRAM_NAME commit" after editing shared instructions.
+  6. Run "$PROGRAM_NAME status" whenever you want to check for drift.
+  7. Optionally run "$PROGRAM_NAME service install" for automatic builds.
 
 The build command combines AGENTS.shared.md followed by AGENTS.local.md without
 changing their content. It shows the proposed change with "git diff --no-index"
@@ -579,6 +583,17 @@ validate_sources() {
     fi
 
     [[ "$failed" -eq 0 ]]
+}
+
+command_code() {
+    validate_sources || exit 1
+    if [[ ! -d "$SKILLS_DIR" || ! -r "$SKILLS_DIR" || ! -x "$SKILLS_DIR" ]]; then
+        die "canonical skills directory is missing or unreadable: $(display_path "$SKILLS_DIR")"
+    fi
+    command -v code >/dev/null 2>&1 || \
+        die "code is required to open the editable sources and canonical skills"
+
+    code "$SHARED_FILE" "$LOCAL_FILE" "$SKILLS_DIR"
 }
 
 write_candidate() {
@@ -2303,6 +2318,9 @@ main() {
     case "$command" in
         status)
             command_status
+            ;;
+        code)
+            command_code
             ;;
         build)
             command_build
