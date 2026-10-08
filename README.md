@@ -32,8 +32,11 @@ agentsmd service install
 - `code` opens the editable shared and local sources plus `~/.agents/skills` in
   one VS Code CLI invocation. It does not open the generated `~/AGENTS.md`.
 - `build` previews the generated diff and requires approval before changing
-  `~/AGENTS.md`. The generated file includes a do-not-edit warning, the rebuild
-  command, and labeled boundaries around each source.
+  `~/AGENTS.md`. The generated file starts with a plain Markdown note that
+  names each source file, how shared changes are committed, and the rebuild
+  command. It is not an HTML comment because some harnesses, such as Claude
+  Code imports, hide comments from the agent. Labeled boundaries mark each
+  source.
 - `commit` previews the configured shared source diff and requires approval
   before committing and pushing it.
 - `install` previews and creates the configured shared-source and harness
