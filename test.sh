@@ -321,6 +321,43 @@ test_install_repairs_the_configured_shared_alias() {
     pass
 }
 
+test_install_imports_generated_file_for_claude() {
+    local home
+    local claude_file
+    local backup
+    local output
+
+    CURRENT_TEST="install gives Claude Code an import instead of a symlink"
+    home="$(new_home claude-import)"
+    claude_file="$home/.claude/CLAUDE.md"
+    printf 'yes\n' | HOME="$home" "$AGENTSMD" build >/dev/null
+    mkdir -p "$home/.claude"
+    ln -s "$home/AGENTS.md" "$claude_file"
+
+    printf 'yes\n' | HOME="$home" "$AGENTSMD" install >/dev/null
+    [[ -f "$claude_file" && ! -L "$claude_file" ]] || \
+        fail "install did not replace the Claude symlink with a file"
+    assert_contains "$(<"$claude_file")" $'\n@~/AGENTS.md'
+    [[ "$(readlink "$home/.codex/AGENTS.md")" == "$home/AGENTS.md" ]] || \
+        fail "install did not link Codex to the generated file"
+    backup="$(
+        find "$home/.cache/agentsmd/backups/.claude" \
+            -name 'CLAUDE.md.*.bak' -print -quit
+    )"
+    [[ -L "$backup" ]] || fail "install did not back up the old Claude symlink"
+
+    output="$(HOME="$home" "$AGENTSMD" status)"
+    assert_contains "$output" "✅ Claude: ~/.claude/CLAUDE.md imports ~/AGENTS.md"
+    output="$(HOME="$home" "$AGENTSMD" install </dev/null)"
+    assert_contains "$output" "No changes. All configured links are installed."
+
+    printf 'edited\n' >"$claude_file"
+    output="$(HOME="$home" "$AGENTSMD" status)"
+    assert_contains "$output" "⚠️  Claude: ~/.claude/CLAUDE.md does not import ~/AGENTS.md"
+
+    pass
+}
+
 test_commit_check_reports_source_changes() {
     local home
     local checkout
@@ -1662,7 +1699,7 @@ test_status_summarizes_service_state() {
     pass
 }
 
-printf '1..37\n'
+printf '1..38\n'
 test_code_opens_overridden_sources_and_skills_once
 test_code_uses_repository_backed_shared_source
 test_code_rejects_missing_inputs
@@ -1670,6 +1707,7 @@ test_code_reports_missing_executable
 test_configured_shared_source_is_used_for_builds
 test_config_discovers_checkout_from_shared_symlink
 test_install_repairs_the_configured_shared_alias
+test_install_imports_generated_file_for_claude
 test_commit_check_reports_source_changes
 test_commit_cancellation_preserves_changes
 test_commit_pushes_only_the_shared_source

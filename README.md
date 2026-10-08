@@ -27,7 +27,7 @@ agentsmd service install
 ```
 
 - `status` shows the configured shared repository, uncommitted shared changes,
-  source files, whether `~/AGENTS.md` is current, the harness symlinks, and
+  source files, whether `~/AGENTS.md` is current, the harness links, and
   whether the background service is running.
 - `code` opens the editable shared and local sources plus `~/.agents/skills` in
   one VS Code CLI invocation. It does not open the generated `~/AGENTS.md`.
@@ -37,7 +37,10 @@ agentsmd service install
 - `commit` previews the configured shared source diff and requires approval
   before committing and pushing it.
 - `install` previews and creates the configured shared-source and harness
-  symlinks after approval.
+  links after approval. Copilot, Codex, and Pi get symlinks to `~/AGENTS.md`.
+  Claude Code gets a `~/.claude/CLAUDE.md` that imports `~/AGENTS.md`, because
+  Claude Code also reads `AGENTS.md` from parent folders and would otherwise
+  load it twice.
 - `self-update` downloads and installs the latest `agentsmd` command.
 - `service install` installs a per-user macOS LaunchAgent. It rebuilds the
   generated file at login and whenever either source file changes.
